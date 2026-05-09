@@ -25,6 +25,7 @@ public actor ConfigurationManager {
 
         static let envGroqAPIKey = "GROQ_API_KEY"
         static let envOpenAIAPIKey = "OPENAI_API_KEY"
+        static let envElevenLabsAPIKey = "ELEVENLABS_API_KEY"
         static let envToggleHotkey = "TOGGLE_RECORDING_HOTKEY"
         static let envRetryHotkey = "RETRY_TRANSCRIPTION_HOTKEY"
         static let envCancelHotkey = "CANCEL_RECORDING_HOTKEY"
@@ -34,35 +35,44 @@ public actor ConfigurationManager {
         static let envWhisperModel = "WHISPER_MODEL"
         static let envWhisperCppModelPath = "WHISPER_CPP_MODEL_PATH"
         static let envWhisperCppRuntime = "WHISPER_CPP_RUNTIME"
+        static let envElevenLabsModel = "ELEVENLABS_MODEL"
         static let envTimeout = "GROQ_TIMEOUT"
         static let envVocabulary = "VOCABULARY"
     }
 
     private let userDefaults: UserDefaults
     private let sharedConfigEnabled: Bool
+    private let configHomeDirectoryOverride: URL?
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
     /// Creates a configuration manager.
-    public init(userDefaults: UserDefaults = .standard, sharedConfigEnabled: Bool = true) {
+    public init(
+        userDefaults: UserDefaults = .standard,
+        sharedConfigEnabled: Bool = true,
+        configHomeDirectoryURL: URL? = nil
+    ) {
         self.userDefaults = userDefaults
         self.sharedConfigEnabled = sharedConfigEnabled
+        self.configHomeDirectoryOverride = configHomeDirectoryURL
     }
 
     /// Loads persisted settings or returns defaults when not yet configured.
     public func loadSettings() throws -> AppSettings {
         var settings = AppSettings.default
 
+        var loadedLocalSettings = false
         if let data = userDefaults.data(forKey: Constants.userDefaultsKey) ?? userDefaults.data(forKey: Constants.legacyUserDefaultsKey) {
             do {
                 settings = try decoder.decode(AppSettings.self, from: data)
+                loadedLocalSettings = true
             } catch {
                 // Corrupt local settings should not block fallback to shared config.
                 settings = .default
             }
         }
 
-        if sharedConfigEnabled, let shared = try loadSettingsFromSharedConfig(base: settings) {
+        if sharedConfigEnabled, let shared = try loadSettingsFromSharedConfig(base: settings, preserveLocalHotkeys: loadedLocalSettings) {
             settings = shared
         }
 
@@ -97,6 +107,8 @@ public actor ConfigurationManager {
                 sharedConfig[Constants.envGroqAPIKey] = key
             case .openAI:
                 sharedConfig[Constants.envOpenAIAPIKey] = key
+            case .elevenLabs:
+                sharedConfig[Constants.envElevenLabsAPIKey] = key
             case .whisperCpp:
                 break
             }
@@ -134,6 +146,8 @@ public actor ConfigurationManager {
                 sharedConfig.removeValue(forKey: Constants.envGroqAPIKey)
             case .openAI:
                 sharedConfig.removeValue(forKey: Constants.envOpenAIAPIKey)
+            case .elevenLabs:
+                sharedConfig.removeValue(forKey: Constants.envElevenLabsAPIKey)
             case .whisperCpp:
                 break
             }
@@ -174,6 +188,8 @@ public actor ConfigurationManager {
                 sharedKeyName = Constants.envGroqAPIKey
             case .openAI:
                 sharedKeyName = Constants.envOpenAIAPIKey
+            case .elevenLabs:
+                sharedKeyName = Constants.envElevenLabsAPIKey
             case .whisperCpp:
                 return nil
             }
@@ -261,7 +277,7 @@ public actor ConfigurationManager {
             .appendingPathComponent(Constants.secretsFileName)
     }
 
-    private func loadSettingsFromSharedConfig(base: AppSettings) throws -> AppSettings? {
+    private func loadSettingsFromSharedConfig(base: AppSettings, preserveLocalHotkeys: Bool) throws -> AppSettings? {
         let shared = try loadSharedConfigValues()
         guard !shared.isEmpty else {
             return nil
@@ -291,6 +307,9 @@ public actor ConfigurationManager {
            let parsedRuntime = WhisperCppRuntime(rawValue: runtime) {
             settings.provider.whisperCppRuntime = parsedRuntime
         }
+        if let model = shared[Constants.envElevenLabsModel]?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
+            settings.provider.elevenLabsModel = model
+        }
 
         if let timeoutRaw = shared[Constants.envTimeout], let parsed = Int(timeoutRaw.trimmingCharacters(in: .whitespacesAndNewlines)) {
             settings.provider.timeoutSeconds = min(max(parsed, 1), 120)
@@ -303,18 +322,33 @@ public actor ConfigurationManager {
                 .filter { !$0.isEmpty }
         }
 
-        var parsedHotkeys: [HotkeyBinding] = []
-        if let toggle = parseSharedHotkey(shared[Constants.envToggleHotkey], actionID: "toggle") {
-            parsedHotkeys.append(toggle)
-        }
-        if let retry = parseSharedHotkey(shared[Constants.envRetryHotkey], actionID: "retry") {
-            parsedHotkeys.append(retry)
-        }
-        if let cancel = parseSharedHotkey(shared[Constants.envCancelHotkey], actionID: "cancel") {
-            parsedHotkeys.append(cancel)
-        }
-        if !parsedHotkeys.isEmpty {
-            settings.hotkeys = parsedHotkeys
+        if !preserveLocalHotkeys {
+            var parsedHotkeys: [HotkeyBinding] = []
+            if let toggle = parseSharedHotkey(shared[Constants.envToggleHotkey], actionID: "toggle") {
+                let profileHotkey = HotkeyBinding(actionID: "recording.default", keyCode: toggle.keyCode, modifiers: toggle.modifiers)
+                settings.recordingProfiles = [
+                    RecordingShortcutProfile(
+                        id: "default",
+                        name: "Default",
+                        hotkey: profileHotkey,
+                        provider: settings.provider.primary,
+                        fallbackProvider: settings.provider.fallback,
+                        model: model(for: settings.provider.primary, provider: settings.provider),
+                        fallbackModel: model(for: settings.provider.fallback, provider: settings.provider),
+                        language: settings.language
+                    )
+                ]
+                parsedHotkeys.append(profileHotkey)
+            }
+            if let retry = parseSharedHotkey(shared[Constants.envRetryHotkey], actionID: "retry") {
+                parsedHotkeys.append(retry)
+            }
+            if let cancel = parseSharedHotkey(shared[Constants.envCancelHotkey], actionID: "cancel") {
+                parsedHotkeys.append(cancel)
+            }
+            if !parsedHotkeys.isEmpty {
+                settings.hotkeys = parsedHotkeys
+            }
         }
 
         try validate(settings: settings)
@@ -330,11 +364,12 @@ public actor ConfigurationManager {
         shared[Constants.envWhisperModel] = settings.provider.groqModel
         shared[Constants.envWhisperCppModelPath] = settings.provider.whisperCppModelPath
         shared[Constants.envWhisperCppRuntime] = settings.provider.whisperCppRuntime.rawValue
+        shared[Constants.envElevenLabsModel] = settings.provider.elevenLabsModel
         shared[Constants.envTimeout] = String(settings.provider.timeoutSeconds)
         shared[Constants.envVocabulary] = settings.vocabularyHints.joined(separator: ",")
 
         let byAction = Dictionary(uniqueKeysWithValues: settings.hotkeys.map { ($0.actionID, $0) })
-        if let toggle = byAction["toggle"], let rendered = renderSharedHotkey(toggle) {
+        if let toggle = settings.hotkeys.first(where: { $0.actionID.hasPrefix("recording.") }), let rendered = renderSharedHotkey(toggle) {
             shared[Constants.envToggleHotkey] = rendered
         }
         if let retry = byAction["retry"], let rendered = renderSharedHotkey(retry) {
@@ -385,6 +420,7 @@ public actor ConfigurationManager {
         let orderedKeys: [String] = [
             Constants.envGroqAPIKey,
             Constants.envOpenAIAPIKey,
+            Constants.envElevenLabsAPIKey,
             Constants.envToggleHotkey,
             Constants.envRetryHotkey,
             Constants.envCancelHotkey,
@@ -394,6 +430,7 @@ public actor ConfigurationManager {
             Constants.envWhisperModel,
             Constants.envWhisperCppModelPath,
             Constants.envWhisperCppRuntime,
+            Constants.envElevenLabsModel,
             Constants.envTimeout,
             Constants.envVocabulary
         ]
@@ -426,6 +463,9 @@ public actor ConfigurationManager {
     }
 
     private func configHomeDirectoryURL() -> URL {
+        if let configHomeDirectoryOverride {
+            return configHomeDirectoryOverride
+        }
         let environment = ProcessInfo.processInfo.environment
         if let xdg = environment["XDG_CONFIG_HOME"], !xdg.isEmpty {
             return URL(fileURLWithPath: xdg, isDirectory: true)
@@ -494,6 +534,19 @@ public actor ConfigurationManager {
         HotkeyCodec.render(binding)
     }
 
+    private func model(for kind: ProviderKind, provider: ProviderConfiguration) -> String {
+        switch kind {
+        case .groq:
+            return provider.groqModel
+        case .openAI:
+            return provider.openAIModel
+        case .whisperCpp:
+            return provider.whisperCppModelPath
+        case .elevenLabs:
+            return provider.elevenLabsModel
+        }
+    }
+
     private func parseSharedBool(_ value: String) -> Bool? {
         switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "1", "true", "yes", "on":
@@ -530,7 +583,7 @@ public actor ConfigurationManager {
 
         var seenActions = Set<String>()
         for hotkey in settings.hotkeys {
-            if !allowedHotkeyActions.contains(hotkey.actionID) {
+            if !allowedHotkeyActions.contains(hotkey.actionID), !hotkey.actionID.hasPrefix("recording.") {
                 issues.append(SettingsValidationIssue(field: "hotkeys.\(hotkey.actionID)", message: "Unsupported actionID"))
             }
             if seenActions.contains(hotkey.actionID) {
@@ -551,8 +604,60 @@ public actor ConfigurationManager {
             issues.append(SettingsValidationIssue(field: "provider.openAIModel", message: "OpenAI model must not be empty"))
         }
 
+        if settings.provider.elevenLabsModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            issues.append(SettingsValidationIssue(field: "provider.elevenLabsModel", message: "ElevenLabs model must not be empty"))
+        }
+
+        var seenProfileIDs = Set<String>()
+        var seenProfileHotkeys = Set<HotkeyBinding>()
+        for profile in settings.recordingProfiles {
+            let normalizedID = profile.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            if normalizedID.isEmpty {
+                issues.append(SettingsValidationIssue(field: "recordingProfiles.id", message: "Profile id must not be empty"))
+            }
+            if seenProfileIDs.contains(normalizedID) {
+                issues.append(SettingsValidationIssue(field: "recordingProfiles.\(normalizedID)", message: "Duplicate profile id"))
+            }
+            seenProfileIDs.insert(normalizedID)
+
+            if profile.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                issues.append(SettingsValidationIssue(field: "recordingProfiles.\(normalizedID).name", message: "Profile name must not be empty"))
+            }
+            if profile.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                issues.append(SettingsValidationIssue(field: "recordingProfiles.\(normalizedID).model", message: "Profile model must not be empty"))
+            }
+            if profile.fallbackModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                issues.append(SettingsValidationIssue(field: "recordingProfiles.\(normalizedID).fallbackModel", message: "Profile fallback model must not be empty"))
+            }
+            if profile.language.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                issues.append(SettingsValidationIssue(field: "recordingProfiles.\(normalizedID).language", message: "Profile language must not be empty"))
+            }
+            if profile.hotkey.actionID != profile.actionID {
+                issues.append(SettingsValidationIssue(field: "recordingProfiles.\(normalizedID).hotkey", message: "Profile hotkey actionID must match profile id"))
+            }
+            let normalizedHotkey = HotkeyBinding(actionID: "", keyCode: profile.hotkey.keyCode, modifiers: profile.hotkey.modifiers)
+            if seenProfileHotkeys.contains(normalizedHotkey) {
+                issues.append(
+                    SettingsValidationIssue(
+                        field: "recordingProfiles.\(normalizedID).hotkey",
+                        message: "Duplicate recording shortcut"
+                    )
+                )
+            }
+            seenProfileHotkeys.insert(normalizedHotkey)
+            if profile.provider == profile.fallbackProvider {
+                issues.append(
+                    SettingsValidationIssue(
+                        field: "recordingProfiles.\(normalizedID).fallbackProvider",
+                        message: "Profile provider and fallback must differ"
+                    )
+                )
+            }
+        }
+
         let usesWhisperCpp = settings.provider.primary == .whisperCpp || settings.provider.fallback == .whisperCpp
-        if usesWhisperCpp, settings.provider.whisperCppModelPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let hasWhisperCppProfile = settings.recordingProfiles.contains { $0.provider == .whisperCpp || $0.fallbackProvider == .whisperCpp }
+        if (usesWhisperCpp || hasWhisperCppProfile), settings.provider.whisperCppModelPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             issues.append(
                 SettingsValidationIssue(
                     field: "provider.whisperCppModelPath",
@@ -584,6 +689,8 @@ public actor ConfigurationManager {
             "openAIModel": settings.provider.openAIModel,
             "whisperCppModelPath": settings.provider.whisperCppModelPath,
             "whisperCppRuntime": settings.provider.whisperCppRuntime.rawValue,
+            "elevenLabsModel": settings.provider.elevenLabsModel,
+            "recordingProfilesCount": String(settings.recordingProfiles.count),
             "vocabularyHintsCount": String(settings.vocabularyHints.count)
         ]
     }

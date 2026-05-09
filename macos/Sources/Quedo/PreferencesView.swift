@@ -40,42 +40,48 @@ struct WhisperCppInstalledModel: Hashable {
     }
 }
 
+struct EditableRecordingProfile: Identifiable, Equatable, Hashable {
+    var id: String
+    var name: String
+    var hotkeyText: String
+    var provider: ProviderKind
+    var fallbackProvider: ProviderKind
+    var model: String
+    var fallbackModel: String
+    var language: String
+}
+
 private enum PreferencesPane: String, CaseIterable, Identifiable {
     case general
-    case providers
-    case apiKeys
-    case hotkeys
+    case recordingProfiles
+    case providerSetup
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .general: return "General"
-        case .providers: return "Providers"
-        case .apiKeys: return "API Keys"
-        case .hotkeys: return "Hotkeys"
+        case .recordingProfiles: return "Recording Profiles"
+        case .providerSetup: return "Provider Setup"
         }
     }
 
     var subtitle: String {
         switch self {
         case .general:
-            return "Language, output, and launch behavior."
-        case .providers:
-            return "Routing, timeout, and model selection."
-        case .apiKeys:
-            return "Manage provider credentials."
-        case .hotkeys:
-            return "Global shortcuts and manual bindings."
+            return "Output, interaction, and launch behavior."
+        case .recordingProfiles:
+            return "Shortcuts, providers, models, and languages."
+        case .providerSetup:
+            return "Credentials, local models, and defaults."
         }
     }
 
     var symbol: String {
         switch self {
         case .general: return "slider.horizontal.3"
-        case .providers: return "network"
-        case .apiKeys: return "key.horizontal"
-        case .hotkeys: return "keyboard"
+        case .recordingProfiles: return "keyboard"
+        case .providerSetup: return "network"
         }
     }
 }
@@ -214,11 +220,9 @@ struct PreferencesView: View {
         switch pane {
         case .general:
             generalPane
-        case .providers:
+        case .providerSetup:
             providersPane
-        case .apiKeys:
-            apiKeysPane
-        case .hotkeys:
+        case .recordingProfiles:
             hotkeysPane
         }
     }
@@ -255,11 +259,6 @@ struct PreferencesView: View {
                         .labelsHidden()
                 }
 
-                settingRow("Language") {
-                    TextField("auto, en, no...", text: $model.language)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: 240)
-                }
             }
 
             PreferencesCard(
@@ -303,42 +302,8 @@ struct PreferencesView: View {
     private var providersPane: some View {
         VStack(alignment: .leading, spacing: 16) {
             PreferencesCard(
-                title: "Provider Routing",
-                subtitle: "Primary handles normal requests; fallback handles failures."
-            ) {
-                settingRow("Primary provider") {
-                    Picker("", selection: $model.primaryProvider) {
-                        ForEach(ProviderKind.allCases, id: \.self) { provider in
-                            Text(providerLabel(provider)).tag(provider)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .frame(maxWidth: 220)
-                }
-
-                settingRow("Fallback provider") {
-                    Picker("", selection: $model.fallbackProvider) {
-                        ForEach(ProviderKind.allCases, id: \.self) { provider in
-                            Text(providerLabel(provider)).tag(provider)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .frame(maxWidth: 220)
-                }
-
-                if let providerError = model.providerSelectionError {
-                    Label(providerError, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .padding(.leading, rowLabelWidth + 12)
-                }
-            }
-
-            PreferencesCard(
-                title: "Models and Timeout",
-                subtitle: "Tune remote model names, local model path, and request timeout."
+                title: "Provider Defaults",
+                subtitle: "Defaults used by CLI, migrations, and new recording profiles."
             ) {
                 settingRow("Timeout") {
                     Stepper(value: $model.timeoutSeconds, in: 1...120) {
@@ -356,6 +321,13 @@ struct PreferencesView: View {
 
                 settingRow("OpenAI model") {
                     TextField("gpt-4o-mini-transcribe", text: $model.openAIModel)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(maxWidth: 340)
+                }
+
+                settingRow("ElevenLabs model") {
+                    TextField("scribe_v2", text: $model.elevenLabsModel)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.body, design: .monospaced))
                         .frame(maxWidth: 340)
@@ -465,6 +437,8 @@ struct PreferencesView: View {
                     .frame(maxWidth: 220)
                 }
             }
+
+            apiKeysPane
         }
     }
 
@@ -472,7 +446,7 @@ struct PreferencesView: View {
         VStack(alignment: .leading, spacing: 16) {
             PreferencesCard(
                 title: "Groq",
-                subtitle: "Used when Groq is primary or fallback."
+                subtitle: "Used by recording profiles that select Groq."
             ) {
                 settingRow("API key") {
                     HStack(spacing: 8) {
@@ -513,7 +487,7 @@ struct PreferencesView: View {
 
             PreferencesCard(
                 title: "OpenAI",
-                subtitle: "Optional unless OpenAI is selected."
+                subtitle: "Used by recording profiles that select OpenAI."
             ) {
                 settingRow("API key") {
                     HStack(spacing: 8) {
@@ -551,14 +525,55 @@ struct PreferencesView: View {
                     .disabled(!model.hasOpenAIKey || model.isSaving)
                 }
             }
+
+            PreferencesCard(
+                title: "ElevenLabs",
+                subtitle: "Required when ElevenLabs Scribe is selected."
+            ) {
+                settingRow("API key") {
+                    HStack(spacing: 8) {
+                        SecureField("Paste new key (optional)", text: $model.elevenLabsAPIKeyInput)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: 400)
+
+                        Label(
+                            model.hasElevenLabsKey ? "Stored" : "Missing",
+                            systemImage: model.hasElevenLabsKey ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                        )
+                        .font(.callout)
+                        .foregroundStyle(model.hasElevenLabsKey ? Color.accentColor : Color.orange)
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    Button("Paste") {
+                        model.pasteAPIKey(.elevenLabs)
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button("Clear Input") {
+                        model.clearAPIKeyInput(.elevenLabs)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.elevenLabsAPIKeyInput.isEmpty)
+
+                    Spacer()
+
+                    Button("Remove Stored Key", role: .destructive) {
+                        Task { await model.clearStoredAPIKey(.elevenLabs) }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!model.hasElevenLabsKey || model.isSaving)
+                }
+            }
         }
     }
 
     private var hotkeysPane: some View {
         VStack(alignment: .leading, spacing: 16) {
             PreferencesCard(
-                title: "Global Hotkeys",
-                subtitle: "Shortcut profile used for recording and controls."
+                title: "Recording Profiles",
+                subtitle: "Each recording shortcut owns its provider, fallback, model, and language."
             ) {
                 settingRow("Enable hotkeys") {
                     Toggle("", isOn: $model.hotkeysEnabled)
@@ -589,18 +604,37 @@ struct PreferencesView: View {
                 }
             }
 
+            if model.hotkeysEnabled {
+                PreferencesCard(
+                    title: "Profiles",
+                    subtitle: "Set the full transcription route for every recording shortcut."
+                ) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach($model.recordingProfiles) { $profile in
+                            recordingProfileEditor(profile: $profile)
+                        }
+
+                        HStack(spacing: 8) {
+                            Button("Add Recording Shortcut") {
+                                model.addRecordingProfile()
+                            }
+                            .buttonStyle(.bordered)
+
+                            Spacer()
+
+                            Text("\(model.recordingProfiles.count) configured")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+
             if model.hotkeysEnabled, model.hotkeyPreset == .manual {
                 PreferencesCard(
-                    title: "Manual Shortcuts",
+                    title: "Control Shortcuts",
                     subtitle: "Format: cmd+shift+r or fn+ctrl. Leave empty to unbind."
                 ) {
-                    manualHotkeyEditor(
-                        title: "Toggle recording",
-                        placeholder: "fn+ctrl",
-                        field: .toggle,
-                        text: $model.manualToggleHotkeyText
-                    )
-
                     manualHotkeyEditor(
                         title: "Retry transcription",
                         placeholder: "fn+ctrl+r",
@@ -616,6 +650,112 @@ struct PreferencesView: View {
                     )
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func recordingProfileEditor(profile: Binding<EditableRecordingProfile>) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                profileField("Name") {
+                    TextField("Default", text: profile.name)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(minWidth: 150)
+                }
+
+                profileField("Shortcut") {
+                    TextField("ctrl+shift+1", text: profile.hotkeyText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(minWidth: 150)
+                }
+
+                profileField("Language") {
+                    TextField("auto, en, no...", text: profile.language)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(minWidth: 110)
+                }
+
+                Spacer(minLength: 8)
+
+                Button("Remove", role: .destructive) {
+                    model.removeRecordingProfile(profile.wrappedValue.id)
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.recordingProfiles.count <= 1)
+            }
+
+            HStack(alignment: .top, spacing: 12) {
+                profileField("Primary") {
+                    Picker("", selection: profile.provider) {
+                        ForEach(ProviderKind.allCases, id: \.self) { provider in
+                            Text(providerLabel(provider)).tag(provider)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(minWidth: 160)
+                }
+
+                profileField("Primary Model") {
+                    TextField(model.profileModelPlaceholder(for: profile.wrappedValue.provider), text: profile.model)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(minWidth: 260)
+                }
+
+                profileField("Fallback") {
+                    Picker("", selection: profile.fallbackProvider) {
+                        ForEach(ProviderKind.allCases, id: \.self) { provider in
+                            Text(providerLabel(provider)).tag(provider)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(minWidth: 160)
+                }
+
+                profileField("Fallback Model") {
+                    TextField(model.profileModelPlaceholder(for: profile.wrappedValue.fallbackProvider), text: profile.fallbackModel)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(minWidth: 260)
+                }
+            }
+
+            if let error = model.recordingProfileError(for: profile.wrappedValue) {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color(nsColor: .textBackgroundColor).opacity(0.55))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.secondary.opacity(0.14), lineWidth: 1)
+        )
+        .onChange(of: profile.wrappedValue.provider) { _, newProvider in
+            model.updatePrimaryProvider(newProvider, for: profile.wrappedValue.id)
+        }
+        .onChange(of: profile.wrappedValue.fallbackProvider) { _, newProvider in
+            model.updateFallbackProvider(newProvider, for: profile.wrappedValue.id)
+        }
+    }
+
+    @ViewBuilder
+    private func profileField<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            content()
         }
     }
 
@@ -684,6 +824,8 @@ struct PreferencesView: View {
             return "OpenAI"
         case .whisperCpp:
             return "whisper.cpp"
+        case .elevenLabs:
+            return "ElevenLabs"
         }
     }
 
@@ -716,27 +858,39 @@ final class PreferencesViewModel: ObservableObject {
     @Published var launchAtLoginEnabled = true
     @Published var language = "auto"
     @Published var vocabularyText = ""
-    @Published var primaryProvider: ProviderKind = .groq
-    @Published var fallbackProvider: ProviderKind = .openAI
     @Published var timeoutSeconds = 12
     @Published var groqModel = "whisper-large-v3"
     @Published var openAIModel = "gpt-4o-mini-transcribe"
     @Published var whisperCppModelPath = "ggml-large-v3.bin"
     @Published var whisperCppRuntime: WhisperCppRuntime = .auto
+    @Published var elevenLabsModel = "scribe_v2"
     @Published var availableWhisperCppModels: [WhisperCppInstalledModel] = []
     @Published var isInstallingWhisperCppModel = false
     @Published var activeWhisperCppDownloadTitle: String?
 
     @Published var hotkeysEnabled = true
     @Published var hotkeyPreset: HotkeyPreset = .fnControl
-    @Published var manualToggleHotkeyText = "fn+ctrl"
     @Published var manualRetryHotkeyText = "fn+ctrl+r"
     @Published var manualCancelHotkeyText = "fn+ctrl+escape"
+    @Published var recordingProfiles: [EditableRecordingProfile] = [
+        EditableRecordingProfile(
+            id: "default",
+            name: "Default",
+            hotkeyText: "fn+ctrl",
+            provider: .groq,
+            fallbackProvider: .openAI,
+            model: "whisper-large-v3",
+            fallbackModel: "gpt-4o-mini-transcribe",
+            language: "auto"
+        )
+    ]
 
     @Published var groqAPIKeyInput = ""
     @Published var openAIAPIKeyInput = ""
+    @Published var elevenLabsAPIKeyInput = ""
     @Published var hasGroqKey = false
     @Published var hasOpenAIKey = false
+    @Published var hasElevenLabsKey = false
     @Published var isSaving = false
 
     @Published var statusMessage: String?
@@ -745,6 +899,7 @@ final class PreferencesViewModel: ObservableObject {
     private let configurationManager: ConfigurationManager
     private let onSaved: @MainActor @Sendable () -> Void
     private var loadedSettings = AppSettings.default
+    private let hotkeyFormatHint = "Invalid shortcut. Use modifiers like ctrl, shift, alt, cmd, or fn plus a key, e.g. ctrl+shift+alt+cmd+g."
 
     let whisperCppInstallPresets: [WhisperCppInstallPreset] = [
         WhisperCppInstallPreset(
@@ -803,29 +958,23 @@ final class PreferencesViewModel: ObservableObject {
         parseVocabularyHints(vocabularyText).count
     }
 
-    var providerSelectionError: String? {
-        if primaryProvider == fallbackProvider {
-            return "Primary and fallback providers must be different."
-        }
-        return nil
-    }
-
     var hasInlineValidationErrors: Bool {
-        if providerSelectionError != nil {
+        if recordingProfiles.contains(where: { recordingProfileError(for: $0) != nil }) {
             return true
         }
         guard hotkeysEnabled, hotkeyPreset == .manual else {
             return false
         }
-        return manualHotkeyError(for: .toggle) != nil
-            || manualHotkeyError(for: .retry) != nil
+        return manualHotkeyError(for: .retry) != nil
             || manualHotkeyError(for: .cancel) != nil
     }
 
     var hasUnsavedChanges: Bool {
         let current = currentSnapshot()
         let loaded = snapshot(from: loadedSettings)
-        let hasPendingAPIInput = !normalize(groqAPIKeyInput).isEmpty || !normalize(openAIAPIKeyInput).isEmpty
+        let hasPendingAPIInput = !normalize(groqAPIKeyInput).isEmpty
+            || !normalize(openAIAPIKeyInput).isEmpty
+            || !normalize(elevenLabsAPIKeyInput).isEmpty
         return current != loaded || hasPendingAPIInput
     }
 
@@ -834,13 +983,11 @@ final class PreferencesViewModel: ObservableObject {
     }
 
     enum ManualHotkeyField {
-        case toggle
         case retry
         case cancel
 
         var actionID: String {
             switch self {
-            case .toggle: return "toggle"
             case .retry: return "retry"
             case .cancel: return "cancel"
             }
@@ -848,7 +995,6 @@ final class PreferencesViewModel: ObservableObject {
 
         var fieldPath: String {
             switch self {
-            case .toggle: return "hotkeys.toggle"
             case .retry: return "hotkeys.retry"
             case .cancel: return "hotkeys.cancel"
             }
@@ -964,6 +1110,8 @@ final class PreferencesViewModel: ObservableObject {
             groqAPIKeyInput = ""
         case .openAI:
             openAIAPIKeyInput = ""
+        case .elevenLabs:
+            elevenLabsAPIKeyInput = ""
         case .whisperCpp:
             break
         }
@@ -972,8 +1120,6 @@ final class PreferencesViewModel: ObservableObject {
     func manualHotkeyError(for field: ManualHotkeyField) -> String? {
         let rawValue: String
         switch field {
-        case .toggle:
-            rawValue = manualToggleHotkeyText
         case .retry:
             rawValue = manualRetryHotkeyText
         case .cancel:
@@ -986,7 +1132,7 @@ final class PreferencesViewModel: ObservableObject {
         }
 
         guard HotkeyCodec.parse(trimmed, actionID: field.actionID) != nil else {
-            return "Invalid format. Example: cmd+shift+r or fn+ctrl"
+            return hotkeyFormatHint
         }
         return nil
     }
@@ -1001,6 +1147,8 @@ final class PreferencesViewModel: ObservableObject {
             groqAPIKeyInput = value
         case .openAI:
             openAIAPIKeyInput = value
+        case .elevenLabs:
+            elevenLabsAPIKeyInput = value
         case .whisperCpp:
             break
         }
@@ -1012,13 +1160,98 @@ final class PreferencesViewModel: ObservableObject {
         }
 
         switch field {
-        case .toggle:
-            manualToggleHotkeyText = value
         case .retry:
             manualRetryHotkeyText = value
         case .cancel:
             manualCancelHotkeyText = value
         }
+    }
+
+    func addRecordingProfile() {
+        let index = recordingProfiles.count + 1
+        let id = uniqueProfileID(base: "profile-\(index)")
+        recordingProfiles.append(
+            EditableRecordingProfile(
+                id: id,
+                name: "Profile \(index)",
+                hotkeyText: "",
+                provider: .elevenLabs,
+                fallbackProvider: .openAI,
+                model: ProviderConfiguration.defaultValue.elevenLabsModel,
+                fallbackModel: ProviderConfiguration.defaultValue.openAIModel,
+                language: "auto"
+            )
+        )
+    }
+
+    func removeRecordingProfile(_ id: String) {
+        guard recordingProfiles.count > 1 else {
+            return
+        }
+        recordingProfiles.removeAll { $0.id == id }
+    }
+
+    func profileModelPlaceholder(for provider: ProviderKind) -> String {
+        defaultModel(for: provider)
+    }
+
+    func updatePrimaryProvider(_ provider: ProviderKind, for profileID: String) {
+        guard let index = recordingProfiles.firstIndex(where: { $0.id == profileID }) else {
+            return
+        }
+        recordingProfiles[index].model = defaultModel(for: provider)
+    }
+
+    func updateFallbackProvider(_ provider: ProviderKind, for profileID: String) {
+        guard let index = recordingProfiles.firstIndex(where: { $0.id == profileID }) else {
+            return
+        }
+        recordingProfiles[index].fallbackModel = defaultModel(for: provider)
+    }
+
+    func defaultModel(for provider: ProviderKind) -> String {
+        switch provider {
+        case .groq:
+            return normalize(groqModel).isEmpty ? ProviderConfiguration.defaultValue.groqModel : normalize(groqModel)
+        case .openAI:
+            return normalize(openAIModel).isEmpty ? ProviderConfiguration.defaultValue.openAIModel : normalize(openAIModel)
+        case .whisperCpp:
+            return normalize(whisperCppModelPath).isEmpty ? ProviderConfiguration.defaultValue.whisperCppModelPath : normalize(whisperCppModelPath)
+        case .elevenLabs:
+            return normalize(elevenLabsModel).isEmpty ? ProviderConfiguration.defaultValue.elevenLabsModel : normalize(elevenLabsModel)
+        }
+    }
+
+    func recordingProfileError(for profile: EditableRecordingProfile) -> String? {
+        if normalize(profile.name).isEmpty {
+            return "Name cannot be empty."
+        }
+        if normalize(profile.model).isEmpty {
+            return "Primary model cannot be empty."
+        }
+        if normalize(profile.fallbackModel).isEmpty {
+            return "Fallback model cannot be empty."
+        }
+        if normalize(profile.language).isEmpty {
+            return "Language cannot be empty."
+        }
+        if profile.provider == profile.fallbackProvider {
+            return "Provider and fallback must be different."
+        }
+        if normalize(profile.hotkeyText).isEmpty {
+            return "Shortcut cannot be empty."
+        }
+        let actionID = "recording.\(profile.id)"
+        guard HotkeyCodec.parse(profile.hotkeyText, actionID: actionID) != nil else {
+            return hotkeyFormatHint
+        }
+        let matchingHotkeys = recordingProfiles.filter {
+            normalizeHotkey($0.hotkeyText) == normalizeHotkey(profile.hotkeyText)
+        }
+        if matchingHotkeys.count > 1 {
+            return "Shortcut is already used by another recording profile."
+        }
+        return nil
     }
 
     func pasteVocabulary() {
@@ -1045,6 +1278,10 @@ final class PreferencesViewModel: ObservableObject {
                 hasOpenAIKey = false
                 openAIAPIKeyInput = ""
                 statusMessage = "OpenAI key removed."
+            case .elevenLabs:
+                hasElevenLabsKey = false
+                elevenLabsAPIKeyInput = ""
+                statusMessage = "ElevenLabs key removed."
             case .whisperCpp:
                 break
             }
@@ -1063,8 +1300,10 @@ final class PreferencesViewModel: ObservableObject {
 
             groqAPIKeyInput = ""
             openAIAPIKeyInput = ""
+            elevenLabsAPIKeyInput = ""
             hasGroqKey = (try await configurationManager.loadAPIKey(for: .groq)) != nil
             hasOpenAIKey = (try await configurationManager.loadAPIKey(for: .openAI)) != nil
+            hasElevenLabsKey = (try await configurationManager.loadAPIKey(for: .elevenLabs)) != nil
             refreshWhisperCppModels()
 
             statusMessage = nil
@@ -1079,6 +1318,7 @@ final class PreferencesViewModel: ObservableObject {
         apply(settings: .default)
         groqAPIKeyInput = ""
         openAIAPIKeyInput = ""
+        elevenLabsAPIKeyInput = ""
         refreshWhisperCppModels()
         statusMessage = "Defaults loaded. Save to apply."
         statusIsError = false
@@ -1088,6 +1328,7 @@ final class PreferencesViewModel: ObservableObject {
         apply(settings: loadedSettings)
         groqAPIKeyInput = ""
         openAIAPIKeyInput = ""
+        elevenLabsAPIKeyInput = ""
         refreshWhisperCppModels()
         statusMessage = "Changes discarded."
         statusIsError = false
@@ -1104,15 +1345,16 @@ final class PreferencesViewModel: ObservableObject {
             return
         }
 
-        if let providerSelectionError {
-            statusMessage = providerSelectionError
-            statusIsError = true
-            return
+        if hotkeysEnabled {
+            if let profileError = recordingProfiles.compactMap(recordingProfileError).first {
+                statusMessage = profileError
+                statusIsError = true
+                return
+            }
         }
 
         if hotkeysEnabled, hotkeyPreset == .manual {
-            if let hotkeyError = manualHotkeyError(for: .toggle)
-                ?? manualHotkeyError(for: .retry)
+            if let hotkeyError = manualHotkeyError(for: .retry)
                 ?? manualHotkeyError(for: .cancel)
             {
                 statusMessage = hotkeyError
@@ -1130,15 +1372,20 @@ final class PreferencesViewModel: ObservableObject {
         loadedSettings.language = normalize(language)
         loadedSettings.vocabularyHints = parseVocabularyHints(vocabularyText)
 
-        loadedSettings.provider.primary = primaryProvider
-        loadedSettings.provider.fallback = fallbackProvider
         loadedSettings.provider.timeoutSeconds = timeoutSeconds
         loadedSettings.provider.groqModel = normalize(groqModel)
         loadedSettings.provider.openAIModel = normalize(openAIModel)
         loadedSettings.provider.whisperCppModelPath = normalize(whisperCppModelPath)
         loadedSettings.provider.whisperCppRuntime = whisperCppRuntime
+        loadedSettings.provider.elevenLabsModel = normalize(elevenLabsModel)
 
         do {
+            let savedProfiles = try recordingProfilesForSave()
+            loadedSettings.recordingProfiles = savedProfiles
+            if let firstProfile = savedProfiles.first {
+                loadedSettings.provider.primary = firstProfile.provider
+                loadedSettings.provider.fallback = firstProfile.fallbackProvider
+            }
             loadedSettings.hotkeys = try hotkeysForSave()
             try await configurationManager.saveSettings(loadedSettings)
 
@@ -1154,8 +1401,15 @@ final class PreferencesViewModel: ObservableObject {
                 openAIAPIKeyInput = ""
             }
 
+            let elevenLabsTrimmed = normalize(elevenLabsAPIKeyInput)
+            if !elevenLabsTrimmed.isEmpty {
+                try await configurationManager.saveAPIKey(elevenLabsTrimmed, for: .elevenLabs)
+                elevenLabsAPIKeyInput = ""
+            }
+
             hasGroqKey = (try await configurationManager.loadAPIKey(for: .groq)) != nil
             hasOpenAIKey = (try await configurationManager.loadAPIKey(for: .openAI)) != nil
+            hasElevenLabsKey = (try await configurationManager.loadAPIKey(for: .elevenLabs)) != nil
 
             statusMessage = "Saved and applied."
             statusIsError = false
@@ -1174,30 +1428,30 @@ final class PreferencesViewModel: ObservableObject {
             return []
         }
 
+        let profileHotkeys = try recordingProfilesForSave().map(\.hotkey)
+        let controlHotkeys: [HotkeyBinding]
         switch hotkeyPreset {
         case .fnControl:
-            return [
-                HotkeyBinding(actionID: "toggle", keyCode: HotkeyBinding.modifiersOnlyKeyCode, modifiers: [.control, .function]),
+            controlHotkeys = [
                 HotkeyBinding(actionID: "retry", keyCode: UInt32(kVK_ANSI_R), modifiers: [.control, .function]),
                 HotkeyBinding(actionID: "cancel", keyCode: UInt32(kVK_Escape), modifiers: [.control, .function])
             ]
         case .ctrlShift:
-            return [
-                HotkeyBinding(actionID: "toggle", keyCode: UInt32(kVK_ANSI_1), modifiers: [.control, .shift]),
+            controlHotkeys = [
                 HotkeyBinding(actionID: "retry", keyCode: UInt32(kVK_ANSI_2), modifiers: [.control, .shift]),
                 HotkeyBinding(actionID: "cancel", keyCode: UInt32(kVK_ANSI_3), modifiers: [.control, .shift])
             ]
         case .manual:
-            return try parseManualHotkeys()
+            controlHotkeys = try parseManualControlHotkeys()
         }
+        return profileHotkeys + controlHotkeys
     }
 
-    private func parseManualHotkeys() throws -> [HotkeyBinding] {
+    private func parseManualControlHotkeys() throws -> [HotkeyBinding] {
         var bindings: [HotkeyBinding] = []
         var issues: [SettingsValidationIssue] = []
 
         let rows: [(field: ManualHotkeyField, rawValue: String)] = [
-            (.toggle, manualToggleHotkeyText),
             (.retry, manualRetryHotkeyText),
             (.cancel, manualCancelHotkeyText)
         ]
@@ -1212,7 +1466,7 @@ final class PreferencesViewModel: ObservableObject {
                 issues.append(
                     SettingsValidationIssue(
                         field: row.field.fieldPath,
-                        message: "Invalid format. Example: cmd+shift+r or fn+ctrl"
+                        message: hotkeyFormatHint
                     )
                 )
                 continue
@@ -1228,22 +1482,69 @@ final class PreferencesViewModel: ObservableObject {
         return bindings
     }
 
+    private func recordingProfilesForSave() throws -> [RecordingShortcutProfile] {
+        var issues: [SettingsValidationIssue] = []
+        var seenIDs = Set<String>()
+
+        let profiles = recordingProfiles.map { editable -> RecordingShortcutProfile? in
+            let id = normalizeProfileID(editable.id)
+            let actionID = "recording.\(id)"
+            if id.isEmpty || seenIDs.contains(id) {
+                issues.append(SettingsValidationIssue(field: "recordingProfiles.\(editable.id)", message: "Profile id must be unique"))
+                return nil
+            }
+            seenIDs.insert(id)
+
+            guard let hotkey = HotkeyCodec.parse(editable.hotkeyText, actionID: actionID) else {
+                issues.append(SettingsValidationIssue(field: "recordingProfiles.\(id).hotkey", message: hotkeyFormatHint))
+                return nil
+            }
+            if editable.provider == editable.fallbackProvider {
+                issues.append(SettingsValidationIssue(field: "recordingProfiles.\(id).fallbackProvider", message: "Provider and fallback must differ"))
+                return nil
+            }
+            if normalize(editable.model).isEmpty {
+                issues.append(SettingsValidationIssue(field: "recordingProfiles.\(id).model", message: "Primary model must not be empty"))
+                return nil
+            }
+            if normalize(editable.fallbackModel).isEmpty {
+                issues.append(SettingsValidationIssue(field: "recordingProfiles.\(id).fallbackModel", message: "Fallback model must not be empty"))
+                return nil
+            }
+
+            return RecordingShortcutProfile(
+                id: id,
+                name: normalize(editable.name),
+                hotkey: hotkey,
+                provider: editable.provider,
+                fallbackProvider: editable.fallbackProvider,
+                model: normalize(editable.model),
+                fallbackModel: normalize(editable.fallbackModel),
+                language: normalize(editable.language)
+            )
+        }.compactMap { $0 }
+
+        if !issues.isEmpty {
+            throw SettingsValidationErrorSet(issues: issues)
+        }
+        return profiles
+    }
+
     private func detectPreset(hotkeys: [HotkeyBinding]) -> HotkeyPreset {
         let fnControl: [HotkeyBinding] = [
-            HotkeyBinding(actionID: "toggle", keyCode: HotkeyBinding.modifiersOnlyKeyCode, modifiers: [.control, .function]),
             HotkeyBinding(actionID: "retry", keyCode: UInt32(kVK_ANSI_R), modifiers: [.control, .function]),
             HotkeyBinding(actionID: "cancel", keyCode: UInt32(kVK_Escape), modifiers: [.control, .function])
         ]
         let ctrlShift: [HotkeyBinding] = [
-            HotkeyBinding(actionID: "toggle", keyCode: UInt32(kVK_ANSI_1), modifiers: [.control, .shift]),
             HotkeyBinding(actionID: "retry", keyCode: UInt32(kVK_ANSI_2), modifiers: [.control, .shift]),
             HotkeyBinding(actionID: "cancel", keyCode: UInt32(kVK_ANSI_3), modifiers: [.control, .shift])
         ]
+        let controlHotkeys = hotkeys.filter { $0.actionID == "retry" || $0.actionID == "cancel" }
 
-        if hotkeys == fnControl {
+        if controlHotkeys == fnControl {
             return .fnControl
         }
-        if hotkeys == ctrlShift {
+        if controlHotkeys == ctrlShift {
             return .ctrlShift
         }
         return .manual
@@ -1251,7 +1552,6 @@ final class PreferencesViewModel: ObservableObject {
 
     private func loadManualHotkeys(from hotkeys: [HotkeyBinding]) {
         let byAction = Dictionary(uniqueKeysWithValues: hotkeys.map { ($0.actionID, $0) })
-        manualToggleHotkeyText = byAction["toggle"].flatMap(HotkeyCodec.render) ?? ""
         manualRetryHotkeyText = byAction["retry"].flatMap(HotkeyCodec.render) ?? ""
         manualCancelHotkeyText = byAction["cancel"].flatMap(HotkeyCodec.render) ?? ""
     }
@@ -1262,7 +1562,12 @@ final class PreferencesViewModel: ObservableObject {
         case "toggle": actionName = "Toggle"
         case "retry": actionName = "Retry"
         case "cancel": actionName = "Cancel"
-        default: actionName = binding.actionID
+        default:
+            if let profile = recordingProfiles.first(where: { "recording.\($0.id)" == binding.actionID }) {
+                actionName = profile.name
+            } else {
+                actionName = binding.actionID
+            }
         }
         return "\(actionName): \(HotkeyCodec.displayString(binding))"
     }
@@ -1349,18 +1654,18 @@ final class PreferencesViewModel: ObservableObject {
         launchAtLoginEnabled = settings.launchAtLoginEnabled
         language = settings.language
         vocabularyText = settings.vocabularyHints.joined(separator: "\n")
-        primaryProvider = settings.provider.primary
-        fallbackProvider = settings.provider.fallback
         timeoutSeconds = settings.provider.timeoutSeconds
         groqModel = settings.provider.groqModel
         openAIModel = settings.provider.openAIModel
         whisperCppModelPath = settings.provider.whisperCppModelPath
         whisperCppRuntime = settings.provider.whisperCppRuntime
+        elevenLabsModel = settings.provider.elevenLabsModel
         availableWhisperCppModels = discoveredWhisperCppModels(currentSelection: normalize(settings.provider.whisperCppModelPath))
 
         hotkeysEnabled = !settings.hotkeys.isEmpty
         hotkeyPreset = detectPreset(hotkeys: settings.hotkeys)
         loadManualHotkeys(from: settings.hotkeys)
+        recordingProfiles = editableProfiles(from: settings)
     }
 
     private struct EditorSnapshot: Equatable {
@@ -1369,18 +1674,17 @@ final class PreferencesViewModel: ObservableObject {
         let launchAtLoginEnabled: Bool
         let language: String
         let vocabularyHints: [String]
-        let primaryProvider: ProviderKind
-        let fallbackProvider: ProviderKind
         let timeoutSeconds: Int
         let groqModel: String
         let openAIModel: String
         let whisperCppModelPath: String
         let whisperCppRuntime: WhisperCppRuntime
+        let elevenLabsModel: String
         let hotkeysEnabled: Bool
         let hotkeyPreset: HotkeyPreset
-        let manualToggleHotkeyText: String
         let manualRetryHotkeyText: String
         let manualCancelHotkeyText: String
+        let recordingProfiles: [EditableRecordingProfile]
     }
 
     private func currentSnapshot() -> EditorSnapshot {
@@ -1390,18 +1694,17 @@ final class PreferencesViewModel: ObservableObject {
             launchAtLoginEnabled: launchAtLoginEnabled,
             language: normalize(language),
             vocabularyHints: parseVocabularyHints(vocabularyText),
-            primaryProvider: primaryProvider,
-            fallbackProvider: fallbackProvider,
             timeoutSeconds: timeoutSeconds,
             groqModel: normalize(groqModel),
             openAIModel: normalize(openAIModel),
             whisperCppModelPath: normalize(whisperCppModelPath),
             whisperCppRuntime: whisperCppRuntime,
+            elevenLabsModel: normalize(elevenLabsModel),
             hotkeysEnabled: hotkeysEnabled,
             hotkeyPreset: hotkeyPreset,
-            manualToggleHotkeyText: normalizeHotkey(manualToggleHotkeyText),
             manualRetryHotkeyText: normalizeHotkey(manualRetryHotkeyText),
-            manualCancelHotkeyText: normalizeHotkey(manualCancelHotkeyText)
+            manualCancelHotkeyText: normalizeHotkey(manualCancelHotkeyText),
+            recordingProfiles: normalizedEditableProfiles(recordingProfiles)
         )
     }
 
@@ -1413,19 +1716,73 @@ final class PreferencesViewModel: ObservableObject {
             launchAtLoginEnabled: settings.launchAtLoginEnabled,
             language: normalize(settings.language),
             vocabularyHints: settings.vocabularyHints.map(normalize),
-            primaryProvider: settings.provider.primary,
-            fallbackProvider: settings.provider.fallback,
             timeoutSeconds: settings.provider.timeoutSeconds,
             groqModel: normalize(settings.provider.groqModel),
             openAIModel: normalize(settings.provider.openAIModel),
             whisperCppModelPath: normalize(settings.provider.whisperCppModelPath),
             whisperCppRuntime: settings.provider.whisperCppRuntime,
+            elevenLabsModel: normalize(settings.provider.elevenLabsModel),
             hotkeysEnabled: !settings.hotkeys.isEmpty,
             hotkeyPreset: detectPreset(hotkeys: settings.hotkeys),
-            manualToggleHotkeyText: normalizeHotkey(byAction["toggle"].flatMap(HotkeyCodec.render) ?? ""),
             manualRetryHotkeyText: normalizeHotkey(byAction["retry"].flatMap(HotkeyCodec.render) ?? ""),
-            manualCancelHotkeyText: normalizeHotkey(byAction["cancel"].flatMap(HotkeyCodec.render) ?? "")
+            manualCancelHotkeyText: normalizeHotkey(byAction["cancel"].flatMap(HotkeyCodec.render) ?? ""),
+            recordingProfiles: normalizedEditableProfiles(editableProfiles(from: settings))
         )
+    }
+
+    private func editableProfiles(from settings: AppSettings) -> [EditableRecordingProfile] {
+        let profiles = settings.recordingProfiles.isEmpty ? [RecordingShortcutProfile.defaultProfile] : settings.recordingProfiles
+        return profiles.map { profile in
+            EditableRecordingProfile(
+                id: profile.id,
+                name: profile.name,
+                hotkeyText: HotkeyCodec.render(profile.hotkey) ?? "",
+                provider: profile.provider,
+                fallbackProvider: profile.fallbackProvider,
+                model: profile.model,
+                fallbackModel: profile.fallbackModel,
+                language: profile.language
+            )
+        }
+    }
+
+    private func normalizedEditableProfiles(_ profiles: [EditableRecordingProfile]) -> [EditableRecordingProfile] {
+        profiles.map {
+            EditableRecordingProfile(
+                id: normalizeProfileID($0.id),
+                name: normalize($0.name),
+                hotkeyText: normalizeHotkey($0.hotkeyText),
+                provider: $0.provider,
+                fallbackProvider: $0.fallbackProvider,
+                model: normalize($0.model),
+                fallbackModel: normalize($0.fallbackModel),
+                language: normalize($0.language)
+            )
+        }
+    }
+
+    private func normalizeProfileID(_ value: String) -> String {
+        let allowed = normalize(value)
+            .lowercased()
+            .map { character -> Character in
+                if character.isLetter || character.isNumber || character == "-" {
+                    return character
+                }
+                return "-"
+            }
+        return String(allowed).trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    }
+
+    private func uniqueProfileID(base: String) -> String {
+        let normalizedBase = normalizeProfileID(base).isEmpty ? "profile" : normalizeProfileID(base)
+        var candidate = normalizedBase
+        var index = 2
+        let existing = Set(recordingProfiles.map { normalizeProfileID($0.id) })
+        while existing.contains(candidate) {
+            candidate = "\(normalizedBase)-\(index)"
+            index += 1
+        }
+        return candidate
     }
 
     private func normalize(_ value: String) -> String {

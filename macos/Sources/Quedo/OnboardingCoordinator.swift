@@ -68,13 +68,13 @@ actor OnboardingCoordinator {
     }
 
     private func runHotkeyVerification(settings: AppSettings) -> Bool {
-        // Hotkeys are optional; if configured, a toggle action must exist.
+        // Hotkeys are optional; if configured, at least one recording action must exist.
         if settings.hotkeys.isEmpty {
             return true
         }
 
         let configured = Set(settings.hotkeys.map(\.actionID))
-        return configured.contains("toggle")
+        return configured.contains("toggle") || configured.contains(where: { $0.hasPrefix("recording.") })
     }
 
     private func runMicrophoneLoopback(audioEngine: AudioCaptureEngine) async -> Bool {

@@ -28,6 +28,20 @@ public struct TranscriptionPipelineResult: Sendable {
     }
 }
 
+/// Per-request provider model overrides.
+public struct TranscriptionModelOverrides: Sendable {
+    /// Primary provider model override.
+    public let primaryModel: String?
+    /// Fallback provider model override.
+    public let fallbackModel: String?
+
+    /// Creates model overrides.
+    public init(primaryModel: String? = nil, fallbackModel: String? = nil) {
+        self.primaryModel = primaryModel
+        self.fallbackModel = fallbackModel
+    }
+}
+
 /// Orchestrates provider selection, retries, fallback, chunking, and cleanup.
 public actor TranscriptionPipeline {
     private let providers: [ProviderKind: any TranscriptionProvider]
@@ -52,6 +66,7 @@ public actor TranscriptionPipeline {
     public func transcribe(
         audioFileURL: URL,
         settings: AppSettings,
+        modelOverrides: TranscriptionModelOverrides = TranscriptionModelOverrides(),
         replacements: [String: String] = [:]
     ) async throws -> TranscriptionPipelineResult {
         let now = Date()
@@ -99,7 +114,7 @@ public actor TranscriptionPipeline {
             let text = try await runChunks(
                 chunks: primaryChunks,
                 with: primary,
-                model: model(for: preferredPrimary, settings: settings),
+                model: modelOverrides.primaryModel ?? model(for: preferredPrimary, settings: settings),
                 language: settings.language,
                 vocabularyHints: settings.vocabularyHints
             )
@@ -114,7 +129,7 @@ public actor TranscriptionPipeline {
                     let text = try await runChunks(
                         chunks: primaryChunks,
                         with: primary,
-                        model: model(for: preferredPrimary, settings: settings),
+                        model: modelOverrides.primaryModel ?? model(for: preferredPrimary, settings: settings),
                         language: settings.language,
                         vocabularyHints: settings.vocabularyHints
                     )
@@ -126,7 +141,7 @@ public actor TranscriptionPipeline {
                         let text = try await runChunks(
                             chunks: fallbackChunks,
                             with: fallback,
-                            model: model(for: preferredFallback, settings: settings),
+                            model: modelOverrides.fallbackModel ?? model(for: preferredFallback, settings: settings),
                             language: settings.language,
                             vocabularyHints: settings.vocabularyHints
                         )
@@ -145,7 +160,7 @@ public actor TranscriptionPipeline {
                 let text = try await runChunks(
                     chunks: fallbackChunks,
                     with: fallback,
-                    model: model(for: preferredFallback, settings: settings),
+                    model: modelOverrides.fallbackModel ?? model(for: preferredFallback, settings: settings),
                     language: settings.language,
                     vocabularyHints: settings.vocabularyHints
                 )
@@ -405,6 +420,8 @@ public actor TranscriptionPipeline {
             return settings.provider.openAIModel
         case .whisperCpp:
             return settings.provider.whisperCppModelPath
+        case .elevenLabs:
+            return settings.provider.elevenLabsModel
         }
     }
 

@@ -16,6 +16,31 @@ final class TranscriptionPipelineTests: XCTestCase {
         XCTAssertEqual(result.text, "fallback transcript")
     }
 
+    func testFallbackUsesExplicitFallbackModelOverride() async throws {
+        let file = try makeTestWAV(name: "pipeline-test-fallback-model-\(UUID().uuidString)", durationSeconds: 1.0)
+
+        let requestedModels = RequestedModelCollector()
+        let primary = ModelRecordingProvider(kind: .groq, mode: .alwaysFail, modelCollector: requestedModels)
+        let fallback = ModelRecordingProvider(kind: .openAI, mode: .alwaysSucceed("fallback transcript"), modelCollector: requestedModels)
+        let pipeline = TranscriptionPipeline(providers: [primary, fallback])
+
+        var settings = AppSettings.default
+        settings.provider.primary = .groq
+        settings.provider.fallback = .openAI
+
+        let result = try await pipeline.transcribe(
+            audioFileURL: file,
+            settings: settings,
+            modelOverrides: TranscriptionModelOverrides(primaryModel: "primary-model", fallbackModel: "fallback-model")
+        )
+        let models = await requestedModels.values()
+
+        XCTAssertEqual(result.providerUsed, .openAI)
+        XCTAssertTrue(result.fallbackUsed)
+        XCTAssertEqual(models[.groq], ["primary-model", "primary-model"])
+        XCTAssertEqual(models[.openAI], ["fallback-model"])
+    }
+
     func testCleanupRemovesKnownHallucinations() async throws {
         let file = try makeTestWAV(name: "pipeline-test-cleanup-\(UUID().uuidString)", durationSeconds: 1.0)
 
@@ -155,6 +180,44 @@ private actor RequestedFileExtensionCollector {
 
     func values() -> [String] {
         valuesInternal
+    }
+}
+
+private actor RequestedModelCollector {
+    private var valuesInternal: [ProviderKind: [String]] = [:]
+
+    func append(_ model: String, for provider: ProviderKind) {
+        valuesInternal[provider, default: []].append(model)
+    }
+
+    func values() -> [ProviderKind: [String]] {
+        valuesInternal
+    }
+}
+
+private struct ModelRecordingProvider: TranscriptionProvider {
+    enum Mode {
+        case alwaysFail
+        case alwaysSucceed(String)
+    }
+
+    let kind: ProviderKind
+    let mode: Mode
+    let modelCollector: RequestedModelCollector
+
+    func transcribe(request: TranscriptionRequest) async throws -> TranscriptionResponse {
+        await modelCollector.append(request.model, for: kind)
+        switch mode {
+        case .alwaysFail:
+            throw ProviderError.transient(statusCode: 503)
+        case let .alwaysSucceed(text):
+            return TranscriptionResponse(text: text, provider: kind, isPartial: false)
+        }
+    }
+
+    func checkHealth(timeoutSeconds: Int) async -> Bool {
+        _ = timeoutSeconds
+        return true
     }
 }
 

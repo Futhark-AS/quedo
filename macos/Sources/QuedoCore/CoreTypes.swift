@@ -40,6 +40,8 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable {
     case openAI
     /// Local whisper.cpp CLI backend.
     case whisperCpp
+    /// ElevenLabs hosted Speech to Text endpoints.
+    case elevenLabs
 }
 
 /// Runtime mode for the local whisper.cpp provider.
@@ -169,6 +171,123 @@ public extension HotkeyBinding {
     static let modifiersOnlyKeyCode: UInt32 = UInt32.max
 }
 
+/// Per-shortcut transcription settings for starting a recording.
+public struct RecordingShortcutProfile: Codable, Hashable, Sendable, Identifiable {
+    /// Stable profile identifier.
+    public var id: String
+    /// Display name shown in preferences.
+    public var name: String
+    /// Hotkey binding that starts/stops this profile.
+    public var hotkey: HotkeyBinding
+    /// Provider to use for recordings started by this hotkey.
+    public var provider: ProviderKind
+    /// Fallback provider for recordings started by this hotkey.
+    public var fallbackProvider: ProviderKind
+    /// Model identifier for the selected provider.
+    public var model: String
+    /// Model identifier for the fallback provider.
+    public var fallbackModel: String
+    /// Language code or `auto` for this hotkey.
+    public var language: String
+
+    /// Action id used in the hotkey manager.
+    public var actionID: String {
+        "recording.\(id)"
+    }
+
+    /// Creates a recording shortcut profile.
+    public init(
+        id: String,
+        name: String,
+        hotkey: HotkeyBinding,
+        provider: ProviderKind,
+        fallbackProvider: ProviderKind = ProviderConfiguration.defaultValue.fallback,
+        model: String,
+        fallbackModel: String? = nil,
+        language: String
+    ) {
+        self.id = id
+        self.name = name
+        self.hotkey = hotkey
+        self.provider = provider
+        self.fallbackProvider = fallbackProvider
+        self.model = model
+        self.fallbackModel = fallbackModel ?? RecordingShortcutProfile.defaultModel(for: fallbackProvider)
+        self.language = language
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case hotkey
+        case provider
+        case fallbackProvider
+        case model
+        case fallbackModel
+        case language
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        hotkey = try container.decode(HotkeyBinding.self, forKey: .hotkey)
+        provider = try container.decode(ProviderKind.self, forKey: .provider)
+        fallbackProvider = try container.decodeIfPresent(ProviderKind.self, forKey: .fallbackProvider) ?? RecordingShortcutProfile.defaultFallback(excluding: provider)
+        model = try container.decode(String.self, forKey: .model)
+        fallbackModel = try container.decodeIfPresent(String.self, forKey: .fallbackModel) ?? RecordingShortcutProfile.defaultModel(for: fallbackProvider)
+        language = try container.decode(String.self, forKey: .language)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(hotkey, forKey: .hotkey)
+        try container.encode(provider, forKey: .provider)
+        try container.encode(fallbackProvider, forKey: .fallbackProvider)
+        try container.encode(model, forKey: .model)
+        try container.encode(fallbackModel, forKey: .fallbackModel)
+        try container.encode(language, forKey: .language)
+    }
+}
+
+public extension RecordingShortcutProfile {
+    /// Returns a fallback provider that differs from the requested provider.
+    static func defaultFallback(excluding provider: ProviderKind) -> ProviderKind {
+        if ProviderConfiguration.defaultValue.fallback != provider {
+            return ProviderConfiguration.defaultValue.fallback
+        }
+        return ProviderKind.allCases.first { $0 != provider } ?? .groq
+    }
+
+    /// Returns the configured default model for a provider.
+    static func defaultModel(for provider: ProviderKind) -> String {
+        switch provider {
+        case .groq:
+            return ProviderConfiguration.defaultValue.groqModel
+        case .openAI:
+            return ProviderConfiguration.defaultValue.openAIModel
+        case .whisperCpp:
+            return ProviderConfiguration.defaultValue.whisperCppModelPath
+        case .elevenLabs:
+            return ProviderConfiguration.defaultValue.elevenLabsModel
+        }
+    }
+
+    /// Default recording profile matching the historical toggle shortcut.
+    static let defaultProfile = RecordingShortcutProfile(
+        id: "default",
+        name: "Default",
+        hotkey: HotkeyBinding(actionID: "recording.default", keyCode: HotkeyBinding.modifiersOnlyKeyCode, modifiers: [.control, .function]),
+        provider: .groq,
+        fallbackProvider: .openAI,
+        model: ProviderConfiguration.defaultValue.groqModel,
+        fallbackModel: ProviderConfiguration.defaultValue.openAIModel,
+        language: "auto"
+    )
+}
+
 /// Provider credentials and request-time settings.
 public struct ProviderConfiguration: Codable, Sendable {
     /// Primary provider to use for normal operations.
@@ -179,6 +298,8 @@ public struct ProviderConfiguration: Codable, Sendable {
     public var groqAPIKeyRef: String
     /// OpenAI API key secret identifier.
     public var openAIAPIKeyRef: String
+    /// ElevenLabs API key secret identifier.
+    public var elevenLabsAPIKeyRef: String
     /// Request timeout for short clips in seconds.
     public var timeoutSeconds: Int
     /// Selected model identifier for Groq.
@@ -189,6 +310,8 @@ public struct ProviderConfiguration: Codable, Sendable {
     public var whisperCppModelPath: String
     /// whisper.cpp runtime mode.
     public var whisperCppRuntime: WhisperCppRuntime
+    /// Selected model identifier for ElevenLabs Speech to Text.
+    public var elevenLabsModel: String
 
     /// Baseline defaults for provider configuration.
     public static let defaultValue = ProviderConfiguration(
@@ -196,11 +319,13 @@ public struct ProviderConfiguration: Codable, Sendable {
         fallback: .openAI,
         groqAPIKeyRef: "groq_api_key",
         openAIAPIKeyRef: "openai_api_key",
+        elevenLabsAPIKeyRef: "elevenlabs_api_key",
         timeoutSeconds: 12,
         groqModel: "whisper-large-v3",
         openAIModel: "gpt-4o-mini-transcribe",
         whisperCppModelPath: "ggml-large-v3.bin",
-        whisperCppRuntime: .auto
+        whisperCppRuntime: .auto,
+        elevenLabsModel: "scribe_v2"
     )
 
     /// Creates provider configuration values.
@@ -209,21 +334,25 @@ public struct ProviderConfiguration: Codable, Sendable {
         fallback: ProviderKind,
         groqAPIKeyRef: String,
         openAIAPIKeyRef: String,
+        elevenLabsAPIKeyRef: String = ProviderConfiguration.defaultValue.elevenLabsAPIKeyRef,
         timeoutSeconds: Int,
         groqModel: String,
         openAIModel: String,
         whisperCppModelPath: String,
-        whisperCppRuntime: WhisperCppRuntime
+        whisperCppRuntime: WhisperCppRuntime,
+        elevenLabsModel: String = ProviderConfiguration.defaultValue.elevenLabsModel
     ) {
         self.primary = primary
         self.fallback = fallback
         self.groqAPIKeyRef = groqAPIKeyRef
         self.openAIAPIKeyRef = openAIAPIKeyRef
+        self.elevenLabsAPIKeyRef = elevenLabsAPIKeyRef
         self.timeoutSeconds = timeoutSeconds
         self.groqModel = groqModel
         self.openAIModel = openAIModel
         self.whisperCppModelPath = whisperCppModelPath
         self.whisperCppRuntime = whisperCppRuntime
+        self.elevenLabsModel = elevenLabsModel
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -231,11 +360,13 @@ public struct ProviderConfiguration: Codable, Sendable {
         case fallback
         case groqAPIKeyRef
         case openAIAPIKeyRef
+        case elevenLabsAPIKeyRef
         case timeoutSeconds
         case groqModel
         case openAIModel
         case whisperCppModelPath
         case whisperCppRuntime
+        case elevenLabsModel
     }
 
     public init(from decoder: any Decoder) throws {
@@ -246,11 +377,13 @@ public struct ProviderConfiguration: Codable, Sendable {
         fallback = try container.decodeIfPresent(ProviderKind.self, forKey: .fallback) ?? defaults.fallback
         groqAPIKeyRef = try container.decodeIfPresent(String.self, forKey: .groqAPIKeyRef) ?? defaults.groqAPIKeyRef
         openAIAPIKeyRef = try container.decodeIfPresent(String.self, forKey: .openAIAPIKeyRef) ?? defaults.openAIAPIKeyRef
+        elevenLabsAPIKeyRef = try container.decodeIfPresent(String.self, forKey: .elevenLabsAPIKeyRef) ?? defaults.elevenLabsAPIKeyRef
         timeoutSeconds = try container.decodeIfPresent(Int.self, forKey: .timeoutSeconds) ?? defaults.timeoutSeconds
         groqModel = try container.decodeIfPresent(String.self, forKey: .groqModel) ?? defaults.groqModel
         openAIModel = try container.decodeIfPresent(String.self, forKey: .openAIModel) ?? defaults.openAIModel
         whisperCppModelPath = try container.decodeIfPresent(String.self, forKey: .whisperCppModelPath) ?? defaults.whisperCppModelPath
         whisperCppRuntime = try container.decodeIfPresent(WhisperCppRuntime.self, forKey: .whisperCppRuntime) ?? defaults.whisperCppRuntime
+        elevenLabsModel = try container.decodeIfPresent(String.self, forKey: .elevenLabsModel) ?? defaults.elevenLabsModel
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -259,11 +392,13 @@ public struct ProviderConfiguration: Codable, Sendable {
         try container.encode(fallback, forKey: .fallback)
         try container.encode(groqAPIKeyRef, forKey: .groqAPIKeyRef)
         try container.encode(openAIAPIKeyRef, forKey: .openAIAPIKeyRef)
+        try container.encode(elevenLabsAPIKeyRef, forKey: .elevenLabsAPIKeyRef)
         try container.encode(timeoutSeconds, forKey: .timeoutSeconds)
         try container.encode(groqModel, forKey: .groqModel)
         try container.encode(openAIModel, forKey: .openAIModel)
         try container.encode(whisperCppModelPath, forKey: .whisperCppModelPath)
         try container.encode(whisperCppRuntime, forKey: .whisperCppRuntime)
+        try container.encode(elevenLabsModel, forKey: .elevenLabsModel)
     }
 }
 
@@ -283,6 +418,8 @@ public struct AppSettings: Codable, Sendable {
     public var launchAtLoginEnabled: Bool
     /// Declared hotkey mappings.
     public var hotkeys: [HotkeyBinding]
+    /// Recording hotkeys with provider/model/language overrides.
+    public var recordingProfiles: [RecordingShortcutProfile]
     /// Provider-specific settings.
     public var provider: ProviderConfiguration
 
@@ -295,6 +432,7 @@ public struct AppSettings: Codable, Sendable {
         recordingInteraction: RecordingInteractionMode,
         launchAtLoginEnabled: Bool,
         hotkeys: [HotkeyBinding],
+        recordingProfiles: [RecordingShortcutProfile] = [RecordingShortcutProfile.defaultProfile],
         provider: ProviderConfiguration
     ) {
         self.buildProfile = buildProfile
@@ -304,6 +442,7 @@ public struct AppSettings: Codable, Sendable {
         self.recordingInteraction = recordingInteraction
         self.launchAtLoginEnabled = launchAtLoginEnabled
         self.hotkeys = hotkeys
+        self.recordingProfiles = recordingProfiles
         self.provider = provider
     }
 
@@ -316,10 +455,11 @@ public struct AppSettings: Codable, Sendable {
         recordingInteraction: .toggle,
         launchAtLoginEnabled: true,
         hotkeys: [
-            HotkeyBinding(actionID: "toggle", keyCode: HotkeyBinding.modifiersOnlyKeyCode, modifiers: [.control, .function]),
+            RecordingShortcutProfile.defaultProfile.hotkey,
             HotkeyBinding(actionID: "retry", keyCode: 15, modifiers: [.control, .function]),
             HotkeyBinding(actionID: "cancel", keyCode: 53, modifiers: [.control, .function])
         ],
+        recordingProfiles: [RecordingShortcutProfile.defaultProfile],
         provider: .defaultValue
     )
 
@@ -331,6 +471,7 @@ public struct AppSettings: Codable, Sendable {
         case recordingInteraction
         case launchAtLoginEnabled
         case hotkeys
+        case recordingProfiles
         case provider
     }
 
@@ -346,6 +487,8 @@ public struct AppSettings: Codable, Sendable {
         launchAtLoginEnabled = try container.decodeIfPresent(Bool.self, forKey: .launchAtLoginEnabled) ?? defaults.launchAtLoginEnabled
         hotkeys = try container.decodeIfPresent([HotkeyBinding].self, forKey: .hotkeys) ?? defaults.hotkeys
         provider = try container.decodeIfPresent(ProviderConfiguration.self, forKey: .provider) ?? defaults.provider
+        recordingProfiles = try container.decodeIfPresent([RecordingShortcutProfile].self, forKey: .recordingProfiles)
+            ?? AppSettings.defaultRecordingProfiles(from: hotkeys, provider: provider, language: language)
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -357,7 +500,42 @@ public struct AppSettings: Codable, Sendable {
         try container.encode(recordingInteraction, forKey: .recordingInteraction)
         try container.encode(launchAtLoginEnabled, forKey: .launchAtLoginEnabled)
         try container.encode(hotkeys, forKey: .hotkeys)
+        try container.encode(recordingProfiles, forKey: .recordingProfiles)
         try container.encode(provider, forKey: .provider)
+    }
+
+    private static func defaultRecordingProfiles(
+        from hotkeys: [HotkeyBinding],
+        provider: ProviderConfiguration,
+        language: String
+    ) -> [RecordingShortcutProfile] {
+        let legacyToggle = hotkeys.first { $0.actionID == "toggle" } ?? RecordingShortcutProfile.defaultProfile.hotkey
+        let hotkey = HotkeyBinding(actionID: "recording.default", keyCode: legacyToggle.keyCode, modifiers: legacyToggle.modifiers)
+        return [
+            RecordingShortcutProfile(
+                id: "default",
+                name: "Default",
+                hotkey: hotkey,
+                provider: provider.primary,
+                fallbackProvider: provider.fallback,
+                model: defaultModel(for: provider.primary, provider: provider),
+                fallbackModel: defaultModel(for: provider.fallback, provider: provider),
+                language: language
+            )
+        ]
+    }
+
+    private static func defaultModel(for kind: ProviderKind, provider: ProviderConfiguration) -> String {
+        switch kind {
+        case .groq:
+            return provider.groqModel
+        case .openAI:
+            return provider.openAIModel
+        case .whisperCpp:
+            return provider.whisperCppModelPath
+        case .elevenLabs:
+            return provider.elevenLabsModel
+        }
     }
 }
 

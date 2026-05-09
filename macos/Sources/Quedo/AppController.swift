@@ -19,6 +19,7 @@ actor AppControllerActor {
     private var settings: AppSettings = .default
     private var isRecording = false
     private var latestAudio: AudioCaptureResult?
+    private var activeRecordingProfile: RecordingShortcutProfile?
 
     init(
         configurationManager: ConfigurationManager,
@@ -210,6 +211,27 @@ actor AppControllerActor {
             case .none:
                 return
             }
+        case let profileAction where profileAction.hasPrefix("recording."):
+            guard let profile = settings.recordingProfiles.first(where: { $0.actionID == profileAction }) else {
+                return
+            }
+            let command = HotkeyRouting.toggleCommand(
+                mode: settings.recordingInteraction,
+                event: event,
+                phase: snapshot.phase,
+                isRecording: isRecording,
+                hasActiveSession: snapshot.currentSessionID != nil
+            )
+            switch command {
+            case .start:
+                await startRecordingFlow(profile: profile)
+            case .stop:
+                await stopRecordingFlow()
+            case .cancelArming:
+                await cancelFlow()
+            case .none:
+                return
+            }
         case "retry":
             guard event == .pressed else {
                 return
@@ -237,7 +259,7 @@ actor AppControllerActor {
         _ = await recoverFromPermissionDegradedStateIfPossible()
     }
 
-    private func startRecordingFlow() async {
+    private func startRecordingFlow(profile: RecordingShortcutProfile? = nil) async {
         if isRecording {
             return
         }
@@ -248,6 +270,7 @@ actor AppControllerActor {
 
         let sessionID = UUID()
         do {
+            activeRecordingProfile = profile
             try await lifecycle.beginSession(id: sessionID)
             try await lifecycle.transition(to: .arming)
             await pushUI()
@@ -269,6 +292,7 @@ actor AppControllerActor {
         } catch let error as AudioCaptureError {
             await audioEngine.cancelRecording()
             isRecording = false
+            activeRecordingProfile = nil
             let degraded: DegradedReason = (error == .noInputDevice) ? .noInputDevice : .internalError
             try? await lifecycle.transition(to: .degraded, degradedReason: degraded)
             await lifecycle.setLastErrorCode("capture_open_failed")
@@ -280,6 +304,7 @@ actor AppControllerActor {
         } catch {
             await audioEngine.cancelRecording()
             isRecording = false
+            activeRecordingProfile = nil
             try? await lifecycle.transition(to: .degraded, degradedReason: .internalError)
             await pushUI()
             await lifecycle.endSession()
@@ -300,7 +325,12 @@ actor AppControllerActor {
             isRecording = false
 
             let start = Date()
-            let pipelineResult = try await transcriptionPipeline.transcribe(audioFileURL: capture.fileURL, settings: settings)
+            let transcriptionSettings = settingsForActiveRecordingProfile()
+            let pipelineResult = try await transcriptionPipeline.transcribe(
+                audioFileURL: capture.fileURL,
+                settings: transcriptionSettings,
+                modelOverrides: modelOverridesForActiveRecordingProfile()
+            )
 
             if pipelineResult.fallbackUsed {
                 try? await lifecycle.transition(to: .providerFallback)
@@ -318,9 +348,9 @@ actor AppControllerActor {
                 sessionID: sessionID,
                 createdAt: Date(),
                 durationMS: capture.durationMS,
-                providerPrimary: settings.provider.primary,
+                providerPrimary: transcriptionSettings.provider.primary,
                 providerUsed: pipelineResult.providerUsed,
-                language: settings.language,
+                language: transcriptionSettings.language,
                 outputMode: settings.outputMode,
                 status: .success,
                 transcript: pipelineResult.text,
@@ -338,9 +368,11 @@ actor AppControllerActor {
 
             try await lifecycle.transition(to: .ready)
             await lifecycle.endSession()
+            activeRecordingProfile = nil
             await pushUI()
         } catch {
             isRecording = false
+            activeRecordingProfile = nil
             try? await lifecycle.transition(to: .retryAvailable)
             await lifecycle.setLastErrorCode("pipeline_failed")
             await lifecycle.endSession()
@@ -376,6 +408,7 @@ actor AppControllerActor {
     private func cancelFlow() async {
         await audioEngine.cancelRecording()
         isRecording = false
+        activeRecordingProfile = nil
         await lifecycle.endSession()
         try? await lifecycle.transition(to: .ready)
         await pushUI()
@@ -388,11 +421,13 @@ actor AppControllerActor {
             fallback: previous.provider.primary,
             groqAPIKeyRef: previous.provider.groqAPIKeyRef,
             openAIAPIKeyRef: previous.provider.openAIAPIKeyRef,
+            elevenLabsAPIKeyRef: previous.provider.elevenLabsAPIKeyRef,
             timeoutSeconds: previous.provider.timeoutSeconds,
             groqModel: previous.provider.groqModel,
             openAIModel: previous.provider.openAIModel,
             whisperCppModelPath: previous.provider.whisperCppModelPath,
-            whisperCppRuntime: previous.provider.whisperCppRuntime
+            whisperCppRuntime: previous.provider.whisperCppRuntime,
+            elevenLabsModel: previous.provider.elevenLabsModel
         )
 
         do {
@@ -513,6 +548,37 @@ actor AppControllerActor {
                 await self?.handleHotkey(actionID: action, event: event)
             }
         }
+    }
+
+    private func settingsForActiveRecordingProfile() -> AppSettings {
+        guard let profile = activeRecordingProfile else {
+            return settings
+        }
+
+        var effective = settings
+        effective.language = profile.language
+        effective.provider.primary = profile.provider
+        effective.provider.fallback = profile.fallbackProvider
+
+        switch profile.provider {
+        case .groq:
+            effective.provider.groqModel = profile.model
+        case .openAI:
+            effective.provider.openAIModel = profile.model
+        case .whisperCpp:
+            effective.provider.whisperCppModelPath = profile.model
+        case .elevenLabs:
+            effective.provider.elevenLabsModel = profile.model
+        }
+
+        return effective
+    }
+
+    private func modelOverridesForActiveRecordingProfile() -> TranscriptionModelOverrides {
+        guard let profile = activeRecordingProfile else {
+            return TranscriptionModelOverrides()
+        }
+        return TranscriptionModelOverrides(primaryModel: profile.model, fallbackModel: profile.fallbackModel)
     }
 
     private func permissionsSatisfyRuntimeRequirements(_ permissions: PermissionSnapshot) -> Bool {

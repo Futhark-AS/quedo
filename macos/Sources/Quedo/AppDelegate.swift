@@ -23,12 +23,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        installMainMenu()
+
         let menuBar = MenuBarController()
         menuBarController = menuBar
 
         Task {
             await bootstrap(menuBar: menuBar)
         }
+    }
+
+    private func installMainMenu() {
+        let mainMenu = NSMenu(title: "Quedo")
+
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu(title: "Quedo")
+        appMenu.addItem(
+            withTitle: "Quit Quedo",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Delete", action: #selector(NSText.delete(_:)), keyEquivalent: "\u{8}")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
+        NSApplication.shared.mainMenu = mainMenu
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -87,6 +119,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let openAIProvider = OpenAIProvider(timeoutSeconds: bootSettings.provider.timeoutSeconds) {
             try await configurationManager.loadAPIKey(for: .openAI) ?? ""
         }
+        let elevenLabsProvider = ElevenLabsProvider(timeoutSeconds: bootSettings.provider.timeoutSeconds) {
+            try await configurationManager.loadAPIKey(for: .elevenLabs) ?? ""
+        }
         let whisperCppProvider = WhisperCppProvider(
             timeoutSeconds: bootSettings.provider.timeoutSeconds
         ) {
@@ -95,7 +130,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try await configurationManager.loadSettings().provider.whisperCppRuntime
         }
         let transcriptionPipeline = TranscriptionPipeline(
-            providers: [groqProvider, openAIProvider, whisperCppProvider],
+            providers: [groqProvider, openAIProvider, elevenLabsProvider, whisperCppProvider],
             requestTimeoutSeconds: bootSettings.provider.timeoutSeconds
         )
 
