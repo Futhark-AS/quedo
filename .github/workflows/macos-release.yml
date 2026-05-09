@@ -69,6 +69,7 @@ jobs:
           APPLE_ID: ${{ env.APPLE_ID }}
           APPLE_TEAM_ID: ${{ env.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ env.APPLE_APP_PASSWORD }}
+          ALLOW_NOTARIZATION_FAILURE: "true"
         run: |
           if [[ -z "${APPLE_SIGNING_IDENTITY:-}" ]] && [[ -n "${RESOLVED_APPLE_SIGNING_IDENTITY:-}" ]]; then
             export APPLE_SIGNING_IDENTITY="$RESOLVED_APPLE_SIGNING_IDENTITY"

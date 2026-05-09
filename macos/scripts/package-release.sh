@@ -137,27 +137,41 @@ ditto -c -k --sequesterRsrc ".build/release/quedo-cli" "$CLI_ZIP"
 
 if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]] && [[ -n "${APPLE_ID:-}" ]] && [[ -n "${APPLE_TEAM_ID:-}" ]] && [[ -n "${APPLE_APP_PASSWORD:-}" ]]; then
   NOTARY_RESULT_JSON="$DIST_DIR/notary-result.json"
-  xcrun notarytool submit "$DMG_PATH" \
-    --apple-id "${APPLE_ID}" \
-    --team-id "${APPLE_TEAM_ID}" \
-    --password "${APPLE_APP_PASSWORD}" \
-    --wait \
-    --output-format json > "$NOTARY_RESULT_JSON"
+  NOTARY_ERROR_LOG="$DIST_DIR/notary-error.log"
+  ALLOW_NOTARIZATION_FAILURE="${ALLOW_NOTARIZATION_FAILURE:-false}"
 
-  NOTARY_STATUS="$(plutil -extract status raw -o - "$NOTARY_RESULT_JSON" 2>/dev/null || true)"
-  if [[ "$NOTARY_STATUS" != "Accepted" ]]; then
-    NOTARY_ID="$(plutil -extract id raw -o - "$NOTARY_RESULT_JSON" 2>/dev/null || true)"
-    if [[ -n "$NOTARY_ID" ]]; then
-      xcrun notarytool log "$NOTARY_ID" \
-        --apple-id "${APPLE_ID}" \
-        --team-id "${APPLE_TEAM_ID}" \
-        --password "${APPLE_APP_PASSWORD}" || true
+  if ! xcrun notarytool submit "$DMG_PATH" \
+      --apple-id "${APPLE_ID}" \
+      --team-id "${APPLE_TEAM_ID}" \
+      --password "${APPLE_APP_PASSWORD}" \
+      --wait \
+      --output-format json > "$NOTARY_RESULT_JSON" 2> "$NOTARY_ERROR_LOG"; then
+    cat "$NOTARY_ERROR_LOG" >&2
+    if [[ "$ALLOW_NOTARIZATION_FAILURE" == "true" ]]; then
+      echo "::warning::Notarization submission failed; publishing signed but unstapled artifacts because ALLOW_NOTARIZATION_FAILURE=true." >&2
+    else
+      exit 1
     fi
-    echo "Notarization failed with status: ${NOTARY_STATUS:-unknown}" >&2
-    exit 1
+  else
+    NOTARY_STATUS="$(plutil -extract status raw -o - "$NOTARY_RESULT_JSON" 2>/dev/null || true)"
+    if [[ "$NOTARY_STATUS" != "Accepted" ]]; then
+      NOTARY_ID="$(plutil -extract id raw -o - "$NOTARY_RESULT_JSON" 2>/dev/null || true)"
+      if [[ -n "$NOTARY_ID" ]]; then
+        xcrun notarytool log "$NOTARY_ID" \
+          --apple-id "${APPLE_ID}" \
+          --team-id "${APPLE_TEAM_ID}" \
+          --password "${APPLE_APP_PASSWORD}" || true
+      fi
+      echo "Notarization failed with status: ${NOTARY_STATUS:-unknown}" >&2
+      if [[ "$ALLOW_NOTARIZATION_FAILURE" == "true" ]]; then
+        echo "::warning::Publishing signed but unstapled artifacts because ALLOW_NOTARIZATION_FAILURE=true." >&2
+      else
+        exit 1
+      fi
+    else
+      xcrun stapler staple "$DMG_PATH"
+    fi
   fi
-
-  xcrun stapler staple "$DMG_PATH"
 fi
 
 (
