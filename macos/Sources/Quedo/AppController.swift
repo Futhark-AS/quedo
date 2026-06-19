@@ -319,21 +319,49 @@ actor AppControllerActor {
         }
 
         var failureStage = "audio capture"
+        var persistedCapture: AudioCaptureResult?
+        var transcriptionSettings = settingsForActiveRecordingProfile()
+        var transcriptionOverrides = modelOverridesForActiveRecordingProfile()
         do {
             try await lifecycle.transition(to: .processing)
             await pushUI()
 
-            let capture = try await audioEngine.stopRecording()
-            latestAudio = capture
+            let rawCapture = try await audioEngine.stopRecording()
             isRecording = false
 
             let start = Date()
-            let transcriptionSettings = settingsForActiveRecordingProfile()
+            transcriptionSettings = settingsForActiveRecordingProfile()
+            transcriptionOverrides = modelOverridesForActiveRecordingProfile()
+            let sessionID = rawCapture.sessionID
+            let capturedAt = Date()
+
+            failureStage = "history pre-save"
+            let pendingRecord = SessionRecord(
+                sessionID: sessionID,
+                createdAt: capturedAt,
+                durationMS: rawCapture.durationMS,
+                providerPrimary: transcriptionSettings.provider.primary,
+                providerUsed: transcriptionSettings.provider.primary,
+                language: transcriptionSettings.language,
+                outputMode: settings.outputMode,
+                status: .retryAvailable,
+                transcript: "",
+                audioPath: rawCapture.fileURL
+            )
+            let durableAudioURL = try await historyStore.saveSession(pendingRecord)
+            let capture = AudioCaptureResult(
+                sessionID: sessionID,
+                fileURL: durableAudioURL,
+                durationMS: rawCapture.durationMS
+            )
+            latestAudio = capture
+            persistedCapture = capture
+
             failureStage = "transcription"
             let pipelineResult = try await transcriptionPipeline.transcribe(
                 audioFileURL: capture.fileURL,
                 settings: transcriptionSettings,
-                modelOverrides: modelOverridesForActiveRecordingProfile()
+                modelOverrides: transcriptionOverrides
             )
 
             if pipelineResult.fallbackUsed {
@@ -342,16 +370,10 @@ actor AppControllerActor {
                 await lifecycle.markFallbackAttempted()
             }
 
-            try await lifecycle.transition(to: .outputting)
-            await pushUI()
-
-            failureStage = "output"
-            _ = try await outputRouter.route(text: pipelineResult.text, mode: settings.outputMode, profile: settings.buildProfile)
-
-            let sessionID = capture.sessionID
+            failureStage = "history save"
             let record = SessionRecord(
                 sessionID: sessionID,
-                createdAt: Date(),
+                createdAt: capturedAt,
                 durationMS: capture.durationMS,
                 providerPrimary: transcriptionSettings.provider.primary,
                 providerUsed: pipelineResult.providerUsed,
@@ -361,9 +383,18 @@ actor AppControllerActor {
                 transcript: pipelineResult.text,
                 audioPath: capture.fileURL
             )
+            let finalAudioURL = try await historyStore.saveSession(record)
+            latestAudio = AudioCaptureResult(
+                sessionID: sessionID,
+                fileURL: finalAudioURL,
+                durationMS: capture.durationMS
+            )
 
-            failureStage = "history save"
-            try await historyStore.saveSession(record)
+            try await lifecycle.transition(to: .outputting)
+            await pushUI()
+
+            failureStage = "output"
+            _ = try await outputRouter.route(text: pipelineResult.text, mode: settings.outputMode, profile: settings.buildProfile)
             await diagnostics.recordMetric(
                 MetricPoint(
                     name: "session_latency_stop_to_final_transcript_ms",
@@ -379,8 +410,8 @@ actor AppControllerActor {
             await pushUI()
         } catch {
             isRecording = false
-            let failedSettings = settingsForActiveRecordingProfile()
-            let failedOverrides = modelOverridesForActiveRecordingProfile()
+            let failedSettings = transcriptionSettings
+            let failedOverrides = transcriptionOverrides
             let detail: String
             if failureStage == "transcription" {
                 detail = transcriptionFailureMessage(error: error, settings: failedSettings, modelOverrides: failedOverrides)
@@ -400,9 +431,24 @@ actor AppControllerActor {
                     ]
                 )
             )
+            if failureStage == "transcription", let persistedCapture {
+                let failedRecord = SessionRecord(
+                    sessionID: persistedCapture.sessionID,
+                    createdAt: Date(),
+                    durationMS: persistedCapture.durationMS,
+                    providerPrimary: failedSettings.provider.primary,
+                    providerUsed: failedSettings.provider.primary,
+                    language: failedSettings.language,
+                    outputMode: settings.outputMode,
+                    status: .retryAvailable,
+                    transcript: "",
+                    audioPath: persistedCapture.fileURL
+                )
+                _ = try? await historyStore.saveSession(failedRecord)
+            }
             activeRecordingProfile = nil
             try? await lifecycle.transition(to: .retryAvailable)
-            await lifecycle.setLastErrorCode("pipeline_failed")
+            await lifecycle.setLastErrorCode(errorCode(forFailureStage: failureStage))
             await lifecycle.endSession()
             await pushUI()
         }
@@ -420,6 +466,25 @@ actor AppControllerActor {
             let result = try await transcriptionPipeline.transcribe(audioFileURL: latestAudio.fileURL, settings: settings)
             try await lifecycle.transition(to: .outputting)
             await pushUI()
+
+            let record = SessionRecord(
+                sessionID: latestAudio.sessionID,
+                createdAt: Date(),
+                durationMS: latestAudio.durationMS,
+                providerPrimary: settings.provider.primary,
+                providerUsed: result.providerUsed,
+                language: settings.language,
+                outputMode: settings.outputMode,
+                status: .success,
+                transcript: result.text,
+                audioPath: latestAudio.fileURL
+            )
+            let durableAudioURL = try await historyStore.saveSession(record)
+            self.latestAudio = AudioCaptureResult(
+                sessionID: latestAudio.sessionID,
+                fileURL: durableAudioURL,
+                durationMS: latestAudio.durationMS
+            )
 
             _ = try await outputRouter.route(text: result.text, mode: settings.outputMode, profile: settings.buildProfile)
 
@@ -724,6 +789,19 @@ Next steps:
         """
     }
 
+    private func errorCode(forFailureStage stage: String) -> String {
+        switch stage {
+        case "audio capture":
+            return "capture_open_failed"
+        case "history pre-save", "history save":
+            return "history_save_failed"
+        case "output":
+            return "output_failed"
+        default:
+            return "pipeline_failed"
+        }
+    }
+
     private func providerLabel(_ provider: ProviderKind) -> String {
         switch provider {
         case .groq:
@@ -789,6 +867,10 @@ Next steps:
             return "Audio capture failed to start. Check microphone access and selected input device."
         case "pipeline_failed":
             return "Transcription pipeline failed. Retry or switch provider."
+        case "history_save_failed":
+            return "Recording was captured, but Quedo could not save it to History."
+        case "output_failed":
+            return "Transcription succeeded, but Quedo could not copy or paste the output."
         case "permissions_not_ready":
             return "Required permissions are missing. Open System Settings and grant access."
         case "hotkey_registration_failed":

@@ -69,6 +69,55 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: tempAudio.path))
     }
 
+    func testSaveSessionCanPromoteRetryAvailableRecordingToSuccess() async throws {
+        let store = try makeIsolatedHistoryStore()
+        let sessionID = UUID()
+        let tempAudio = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("history-test-promote-\(sessionID.uuidString).wav")
+        try Data("audio".utf8).write(to: tempAudio)
+
+        let pending = SessionRecord(
+            sessionID: sessionID,
+            createdAt: Date(),
+            durationMS: 3000,
+            providerPrimary: .elevenLabs,
+            providerUsed: .elevenLabs,
+            language: "no",
+            outputMode: .clipboard,
+            status: .retryAvailable,
+            transcript: "",
+            audioPath: tempAudio
+        )
+
+        let persistedAudio = try await store.saveSession(pending)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: persistedAudio.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tempAudio.path))
+
+        let success = SessionRecord(
+            sessionID: sessionID,
+            createdAt: pending.createdAt,
+            durationMS: 3000,
+            providerPrimary: .elevenLabs,
+            providerUsed: .elevenLabs,
+            language: "no",
+            outputMode: .clipboard,
+            status: .success,
+            transcript: "ferdig tekst",
+            audioPath: persistedAudio
+        )
+
+        let promotedAudio = try await store.saveSession(success)
+        let sessions = try await store.listSessions(limit: 1)
+        let transcript = try await store.transcriptText(sessionID: sessionID)
+        let primaryAudio = try await store.primaryAudioFileURL(sessionID: sessionID)
+
+        XCTAssertEqual(promotedAudio, persistedAudio)
+        XCTAssertEqual(sessions.first?.sessionID, sessionID)
+        XCTAssertEqual(sessions.first?.status, .success)
+        XCTAssertEqual(sessions.first?.transcriptPreview, "ferdig tekst")
+        XCTAssertEqual(transcript, "ferdig tekst")
+        XCTAssertEqual(primaryAudio, persistedAudio)
+    }
+
     private func makeIsolatedHistoryStore() throws -> HistoryStore {
         let baseURL = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("quedo-history-test-\(UUID().uuidString)", isDirectory: true)

@@ -95,11 +95,12 @@ public actor HistoryStore {
     }
 
     /// Stores a completed session and related artifacts.
+    @discardableResult
     public func saveSession(
         _ session: SessionRecord,
         legacySourcePath: String? = nil,
         legacyAudioFormat: String? = nil
-    ) throws {
+    ) throws -> URL {
         let persistedAudioPath = try persistAudioArtifact(sessionID: session.sessionID, sourcePath: session.audioPath)
 
         try execute("BEGIN IMMEDIATE TRANSACTION")
@@ -133,6 +134,16 @@ public actor HistoryStore {
             bindOptionalText(legacySourcePath, to: 9, in: insertSession)
             bindOptionalText(legacyAudioFormat, to: 10, in: insertSession)
             try stepDone(insertSession)
+
+            let deletePrimaryMediaStatement = try prepare(
+                """
+                DELETE FROM session_media
+                WHERE session_id = ? AND media_type = 'audio' AND is_primary = 1;
+                """
+            )
+            defer { sqlite3_finalize(deletePrimaryMediaStatement) }
+            bindText(session.sessionID.uuidString, to: 1, in: deletePrimaryMediaStatement)
+            try stepDone(deletePrimaryMediaStatement)
 
             let mediaStatement = try prepare(
                 """
@@ -177,6 +188,8 @@ public actor HistoryStore {
             try? execute("ROLLBACK")
             throw error
         }
+
+        return persistedAudioPath
     }
 
     /// Appends a structured session event entry.
