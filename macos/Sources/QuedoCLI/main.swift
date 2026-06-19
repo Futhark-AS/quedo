@@ -2,6 +2,12 @@ import ArgumentParser
 import Foundation
 import QuedoCore
 
+extension ProviderKind: ExpressibleByArgument {
+    public init?(argument: String) {
+        self.init(rawValue: argument)
+    }
+}
+
 private struct ProcessRunResult {
     let status: Int32
     let stderr: String
@@ -317,6 +323,21 @@ struct Transcribe: AsyncParsableCommand {
     @Option(help: "Language override")
     var language: String?
 
+    @Option(help: "Primary provider override")
+    var provider: ProviderKind?
+
+    @Option(help: "Primary model override")
+    var model: String?
+
+    @Option(help: "Fallback provider override")
+    var fallbackProvider: ProviderKind?
+
+    @Option(help: "Fallback model override")
+    var fallbackModel: String?
+
+    @Option(help: "Timeout per transcription request in seconds")
+    var timeoutSeconds: Int?
+
     mutating func run() async throws {
         let source = URL(fileURLWithPath: file)
         guard FileManager.default.fileExists(atPath: source.path) else {
@@ -327,6 +348,15 @@ struct Transcribe: AsyncParsableCommand {
         var settings = try await config.loadSettings()
         if let language, !language.isEmpty {
             settings.language = language
+        }
+        if let provider {
+            settings.provider.primary = provider
+        }
+        if let fallbackProvider {
+            settings.provider.fallback = fallbackProvider
+        }
+        if let timeoutSeconds {
+            settings.provider.timeoutSeconds = max(1, timeoutSeconds)
         }
 
         let groq = GroqProvider(timeoutSeconds: settings.provider.timeoutSeconds) {
@@ -356,7 +386,11 @@ struct Transcribe: AsyncParsableCommand {
             providers: [groq, openAI, azureSpeech, openRouter, elevenLabs, whisperCpp],
             requestTimeoutSeconds: settings.provider.timeoutSeconds
         )
-        let result = try await pipeline.transcribe(audioFileURL: source, settings: settings)
+        let result = try await pipeline.transcribe(
+            audioFileURL: source,
+            settings: settings,
+            modelOverrides: TranscriptionModelOverrides(primaryModel: model, fallbackModel: fallbackModel)
+        )
         print(result.text)
     }
 }
