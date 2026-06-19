@@ -117,4 +117,10 @@ final class StateMachineTests: XCTestCase {
         XCTAssertEqual(contract.notificationCopy, "Permission needed for full functionality.")
         XCTAssertTrue(contract.actions.contains(.openSettings))
     }
+
+    func testReadyContractIncludesPlaybackAction() async {
+        let contract = LifecycleStateMachine.uiContract(for: .ready, degradedReason: nil)
+        XCTAssertTrue(contract.actions.contains(.history))
+        XCTAssertTrue(contract.actions.contains(.playLastRecording))
+    }
 }

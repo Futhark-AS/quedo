@@ -42,6 +42,8 @@ public enum AppAction: String, Sendable, CaseIterable {
     case preferences = "Preferences"
     /// Open transcription history.
     case history = "History"
+    /// Play the most recently saved recording.
+    case playLastRecording = "Play Last Recording"
     /// Run diagnostic checks.
     case runChecks = "Run Checks"
     /// Copy partial transcript.
@@ -244,7 +246,7 @@ public actor LifecycleStateMachine {
             return UIStateContract(
                 icon: "mic",
                 notificationCopy: nil,
-                actions: [.startRecording, .preferences, .history, .runChecks]
+                actions: [.startRecording, .preferences, .history, .playLastRecording, .runChecks]
             )
         case .arming:
             return UIStateContract(
