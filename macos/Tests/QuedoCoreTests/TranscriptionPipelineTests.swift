@@ -133,6 +133,39 @@ final class TranscriptionPipelineTests: XCTestCase {
         XCTAssertEqual(capturedExtensions, ["flac", "flac"])
     }
 
+    func testSplitsLongInt16WAVWithoutAudioToolboxAbort() async throws {
+        let file = try makeInt16TestWAV(
+            name: "pipeline-test-int16-split-\(UUID().uuidString)",
+            durationSeconds: 301.0,
+            sampleRate: 48_000
+        )
+
+        let counter = CallCounter()
+        let extensions = RequestedFileExtensionCollector()
+        let primary = CountingProvider(
+            kind: .openRouter,
+            counter: counter,
+            extensionCollector: extensions,
+            requiresFlacUpload: false
+        )
+        let fallback = MockProvider(kind: .groq, mode: .alwaysSucceed("unused"))
+        let pipeline = TranscriptionPipeline(providers: [primary, fallback], requestTimeoutSeconds: 2)
+
+        var settings = AppSettings.default
+        settings.provider.primary = .openRouter
+        settings.provider.fallback = .groq
+
+        let result = try await pipeline.transcribe(audioFileURL: file, settings: settings)
+        let calls = await counter.value()
+        let capturedExtensions = await extensions.values()
+
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(result.text, "chunk-1 chunk-2")
+        XCTAssertEqual(result.providerUsed, .openRouter)
+        XCTAssertFalse(result.fallbackUsed)
+        XCTAssertEqual(capturedExtensions, ["wav", "wav"])
+    }
+
     func testUploadsFlacWhenInputIsWAV() async throws {
         let file = try makeTestWAV(
             name: "pipeline-test-upload-flac-\(UUID().uuidString)",
@@ -347,4 +380,58 @@ private func makeTestWAV(name: String, durationSeconds: Double, sampleRate: Doub
 
     try file.write(from: buffer)
     return url
+}
+
+private func makeInt16TestWAV(name: String, durationSeconds: Double, sampleRate: Double) throws -> URL {
+    let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(name).appendingPathExtension("wav")
+    if FileManager.default.fileExists(atPath: url.path) {
+        try FileManager.default.removeItem(at: url)
+    }
+
+    let channels = UInt16(1)
+    let bitsPerSample = UInt16(16)
+    let blockAlign = channels * (bitsPerSample / 8)
+    let sampleRateValue = UInt32(sampleRate)
+    let byteRate = sampleRateValue * UInt32(blockAlign)
+    let frameCount = UInt32(max(1, Int(durationSeconds * sampleRate)))
+    let dataSize = frameCount * UInt32(blockAlign)
+    let riffPayloadSize = UInt32(4 + 8 + 16 + 8) + dataSize
+
+    guard sampleRateValue > 0, dataSize > 0 else {
+        throw TestAudioError.bufferAllocationFailed
+    }
+
+    var wav = Data()
+    wav.reserveCapacity(Int(44 + dataSize))
+    wav.append(contentsOf: [0x52, 0x49, 0x46, 0x46])
+    wav.appendLittleEndianUInt32(riffPayloadSize)
+    wav.append(contentsOf: [0x57, 0x41, 0x56, 0x45])
+    wav.append(contentsOf: [0x66, 0x6D, 0x74, 0x20])
+    wav.appendLittleEndianUInt32(16)
+    wav.appendLittleEndianUInt16(1)
+    wav.appendLittleEndianUInt16(channels)
+    wav.appendLittleEndianUInt32(sampleRateValue)
+    wav.appendLittleEndianUInt32(byteRate)
+    wav.appendLittleEndianUInt16(blockAlign)
+    wav.appendLittleEndianUInt16(bitsPerSample)
+    wav.append(contentsOf: [0x64, 0x61, 0x74, 0x61])
+    wav.appendLittleEndianUInt32(dataSize)
+    wav.append(Data(repeating: 0, count: Int(dataSize)))
+    try wav.write(to: url, options: .atomic)
+
+    return url
+}
+
+private extension Data {
+    mutating func appendLittleEndianUInt16(_ value: UInt16) {
+        append(UInt8(value & 0xFF))
+        append(UInt8((value >> 8) & 0xFF))
+    }
+
+    mutating func appendLittleEndianUInt32(_ value: UInt32) {
+        append(UInt8(value & 0xFF))
+        append(UInt8((value >> 8) & 0xFF))
+        append(UInt8((value >> 16) & 0xFF))
+        append(UInt8((value >> 24) & 0xFF))
+    }
 }
