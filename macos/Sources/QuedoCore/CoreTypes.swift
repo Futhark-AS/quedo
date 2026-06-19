@@ -38,6 +38,10 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable {
     case groq
     /// OpenAI hosted model endpoints.
     case openAI
+    /// Azure Speech LLM Speech endpoints, including MAI-Transcribe models.
+    case azureSpeech
+    /// OpenRouter speech-to-text endpoint with arbitrary transcription model slugs.
+    case openRouter
     /// Local whisper.cpp CLI backend.
     case whisperCpp
     /// ElevenLabs hosted Speech to Text endpoints.
@@ -268,6 +272,10 @@ public extension RecordingShortcutProfile {
             return ProviderConfiguration.defaultValue.groqModel
         case .openAI:
             return ProviderConfiguration.defaultValue.openAIModel
+        case .azureSpeech:
+            return ProviderConfiguration.defaultValue.azureSpeechModel
+        case .openRouter:
+            return ProviderConfiguration.defaultValue.openRouterModel
         case .whisperCpp:
             return ProviderConfiguration.defaultValue.whisperCppModelPath
         case .elevenLabs:
@@ -298,6 +306,10 @@ public struct ProviderConfiguration: Codable, Sendable {
     public var groqAPIKeyRef: String
     /// OpenAI API key secret identifier.
     public var openAIAPIKeyRef: String
+    /// Azure Speech API key secret identifier.
+    public var azureSpeechAPIKeyRef: String
+    /// OpenRouter API key secret identifier.
+    public var openRouterAPIKeyRef: String
     /// ElevenLabs API key secret identifier.
     public var elevenLabsAPIKeyRef: String
     /// Request timeout for short clips in seconds.
@@ -306,6 +318,12 @@ public struct ProviderConfiguration: Codable, Sendable {
     public var groqModel: String
     /// Selected model identifier for OpenAI.
     public var openAIModel: String
+    /// Azure Speech endpoint URL.
+    public var azureSpeechEndpoint: String
+    /// Selected Azure Speech enhanced transcription model.
+    public var azureSpeechModel: String
+    /// Selected OpenRouter transcription model slug.
+    public var openRouterModel: String
     /// whisper.cpp model path or model filename.
     public var whisperCppModelPath: String
     /// whisper.cpp runtime mode.
@@ -319,10 +337,15 @@ public struct ProviderConfiguration: Codable, Sendable {
         fallback: .openAI,
         groqAPIKeyRef: "groq_api_key",
         openAIAPIKeyRef: "openai_api_key",
+        azureSpeechAPIKeyRef: "azure_speech_api_key",
+        openRouterAPIKeyRef: "openrouter_api_key",
         elevenLabsAPIKeyRef: "elevenlabs_api_key",
         timeoutSeconds: 12,
         groqModel: "whisper-large-v3",
         openAIModel: "gpt-4o-mini-transcribe",
+        azureSpeechEndpoint: "",
+        azureSpeechModel: "mai-transcribe-1.5",
+        openRouterModel: "microsoft/mai-transcribe-1.5",
         whisperCppModelPath: "ggml-large-v3.bin",
         whisperCppRuntime: .auto,
         elevenLabsModel: "scribe_v2"
@@ -334,10 +357,15 @@ public struct ProviderConfiguration: Codable, Sendable {
         fallback: ProviderKind,
         groqAPIKeyRef: String,
         openAIAPIKeyRef: String,
+        azureSpeechAPIKeyRef: String = ProviderConfiguration.defaultValue.azureSpeechAPIKeyRef,
+        openRouterAPIKeyRef: String = ProviderConfiguration.defaultValue.openRouterAPIKeyRef,
         elevenLabsAPIKeyRef: String = ProviderConfiguration.defaultValue.elevenLabsAPIKeyRef,
         timeoutSeconds: Int,
         groqModel: String,
         openAIModel: String,
+        azureSpeechEndpoint: String = ProviderConfiguration.defaultValue.azureSpeechEndpoint,
+        azureSpeechModel: String = ProviderConfiguration.defaultValue.azureSpeechModel,
+        openRouterModel: String = ProviderConfiguration.defaultValue.openRouterModel,
         whisperCppModelPath: String,
         whisperCppRuntime: WhisperCppRuntime,
         elevenLabsModel: String = ProviderConfiguration.defaultValue.elevenLabsModel
@@ -346,10 +374,15 @@ public struct ProviderConfiguration: Codable, Sendable {
         self.fallback = fallback
         self.groqAPIKeyRef = groqAPIKeyRef
         self.openAIAPIKeyRef = openAIAPIKeyRef
+        self.azureSpeechAPIKeyRef = azureSpeechAPIKeyRef
+        self.openRouterAPIKeyRef = openRouterAPIKeyRef
         self.elevenLabsAPIKeyRef = elevenLabsAPIKeyRef
         self.timeoutSeconds = timeoutSeconds
         self.groqModel = groqModel
         self.openAIModel = openAIModel
+        self.azureSpeechEndpoint = azureSpeechEndpoint
+        self.azureSpeechModel = azureSpeechModel
+        self.openRouterModel = openRouterModel
         self.whisperCppModelPath = whisperCppModelPath
         self.whisperCppRuntime = whisperCppRuntime
         self.elevenLabsModel = elevenLabsModel
@@ -360,10 +393,15 @@ public struct ProviderConfiguration: Codable, Sendable {
         case fallback
         case groqAPIKeyRef
         case openAIAPIKeyRef
+        case azureSpeechAPIKeyRef
+        case openRouterAPIKeyRef
         case elevenLabsAPIKeyRef
         case timeoutSeconds
         case groqModel
         case openAIModel
+        case azureSpeechEndpoint
+        case azureSpeechModel
+        case openRouterModel
         case whisperCppModelPath
         case whisperCppRuntime
         case elevenLabsModel
@@ -377,10 +415,15 @@ public struct ProviderConfiguration: Codable, Sendable {
         fallback = try container.decodeIfPresent(ProviderKind.self, forKey: .fallback) ?? defaults.fallback
         groqAPIKeyRef = try container.decodeIfPresent(String.self, forKey: .groqAPIKeyRef) ?? defaults.groqAPIKeyRef
         openAIAPIKeyRef = try container.decodeIfPresent(String.self, forKey: .openAIAPIKeyRef) ?? defaults.openAIAPIKeyRef
+        azureSpeechAPIKeyRef = try container.decodeIfPresent(String.self, forKey: .azureSpeechAPIKeyRef) ?? defaults.azureSpeechAPIKeyRef
+        openRouterAPIKeyRef = try container.decodeIfPresent(String.self, forKey: .openRouterAPIKeyRef) ?? defaults.openRouterAPIKeyRef
         elevenLabsAPIKeyRef = try container.decodeIfPresent(String.self, forKey: .elevenLabsAPIKeyRef) ?? defaults.elevenLabsAPIKeyRef
         timeoutSeconds = try container.decodeIfPresent(Int.self, forKey: .timeoutSeconds) ?? defaults.timeoutSeconds
         groqModel = try container.decodeIfPresent(String.self, forKey: .groqModel) ?? defaults.groqModel
         openAIModel = try container.decodeIfPresent(String.self, forKey: .openAIModel) ?? defaults.openAIModel
+        azureSpeechEndpoint = try container.decodeIfPresent(String.self, forKey: .azureSpeechEndpoint) ?? defaults.azureSpeechEndpoint
+        azureSpeechModel = try container.decodeIfPresent(String.self, forKey: .azureSpeechModel) ?? defaults.azureSpeechModel
+        openRouterModel = try container.decodeIfPresent(String.self, forKey: .openRouterModel) ?? defaults.openRouterModel
         whisperCppModelPath = try container.decodeIfPresent(String.self, forKey: .whisperCppModelPath) ?? defaults.whisperCppModelPath
         whisperCppRuntime = try container.decodeIfPresent(WhisperCppRuntime.self, forKey: .whisperCppRuntime) ?? defaults.whisperCppRuntime
         elevenLabsModel = try container.decodeIfPresent(String.self, forKey: .elevenLabsModel) ?? defaults.elevenLabsModel
@@ -392,10 +435,15 @@ public struct ProviderConfiguration: Codable, Sendable {
         try container.encode(fallback, forKey: .fallback)
         try container.encode(groqAPIKeyRef, forKey: .groqAPIKeyRef)
         try container.encode(openAIAPIKeyRef, forKey: .openAIAPIKeyRef)
+        try container.encode(azureSpeechAPIKeyRef, forKey: .azureSpeechAPIKeyRef)
+        try container.encode(openRouterAPIKeyRef, forKey: .openRouterAPIKeyRef)
         try container.encode(elevenLabsAPIKeyRef, forKey: .elevenLabsAPIKeyRef)
         try container.encode(timeoutSeconds, forKey: .timeoutSeconds)
         try container.encode(groqModel, forKey: .groqModel)
         try container.encode(openAIModel, forKey: .openAIModel)
+        try container.encode(azureSpeechEndpoint, forKey: .azureSpeechEndpoint)
+        try container.encode(azureSpeechModel, forKey: .azureSpeechModel)
+        try container.encode(openRouterModel, forKey: .openRouterModel)
         try container.encode(whisperCppModelPath, forKey: .whisperCppModelPath)
         try container.encode(whisperCppRuntime, forKey: .whisperCppRuntime)
         try container.encode(elevenLabsModel, forKey: .elevenLabsModel)
@@ -531,6 +579,10 @@ public struct AppSettings: Codable, Sendable {
             return provider.groqModel
         case .openAI:
             return provider.openAIModel
+        case .azureSpeech:
+            return provider.azureSpeechModel
+        case .openRouter:
+            return provider.openRouterModel
         case .whisperCpp:
             return provider.whisperCppModelPath
         case .elevenLabs:

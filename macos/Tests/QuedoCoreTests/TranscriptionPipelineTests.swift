@@ -77,6 +77,35 @@ final class TranscriptionPipelineTests: XCTestCase {
         XCTAssertLessThan(elapsed, 8.0)
     }
 
+    func testRetryAvailableIncludesProviderFailureDetails() async throws {
+        let file = try makeTestWAV(name: "pipeline-test-failure-details-\(UUID().uuidString)", durationSeconds: 1.0)
+
+        let primary = MockProvider(kind: .groq, mode: .alwaysFail)
+        let fallback = MockProvider(kind: .openAI, mode: .alwaysFail)
+        let pipeline = TranscriptionPipeline(providers: [primary, fallback], requestTimeoutSeconds: 1)
+
+        var settings = AppSettings.default
+        settings.provider.primary = .groq
+        settings.provider.fallback = .openAI
+
+        do {
+            _ = try await pipeline.transcribe(audioFileURL: file, settings: settings)
+            XCTFail("Expected retryAvailable error")
+        } catch let error as TranscriptionPipelineError {
+            switch error {
+            case let .retryAvailable(primary, fallback, primaryErrorDescription, fallbackErrorDescription):
+                XCTAssertEqual(primary, .groq)
+                XCTAssertEqual(fallback, .openAI)
+                XCTAssertEqual(primaryErrorDescription, "temporary HTTP 503")
+                XCTAssertEqual(fallbackErrorDescription, "temporary HTTP 503")
+            default:
+                XCTFail("Expected retryAvailable, got \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
     func testSplitsAudioLongerThanFiveMinutes() async throws {
         let file = try makeTestWAV(
             name: "pipeline-test-split-\(UUID().uuidString)",

@@ -25,6 +25,11 @@ public actor ConfigurationManager {
 
         static let envGroqAPIKey = "GROQ_API_KEY"
         static let envOpenAIAPIKey = "OPENAI_API_KEY"
+        static let envAzureSpeechAPIKey = "AZURE_SPEECH_KEY"
+        static let envAzureSpeechEndpoint = "AZURE_SPEECH_ENDPOINT"
+        static let envAzureSpeechModel = "AZURE_SPEECH_MODEL"
+        static let envOpenRouterAPIKey = "OPENROUTER_API_KEY"
+        static let envOpenRouterModel = "OPENROUTER_MODEL"
         static let envElevenLabsAPIKey = "ELEVENLABS_API_KEY"
         static let envToggleHotkey = "TOGGLE_RECORDING_HOTKEY"
         static let envRetryHotkey = "RETRY_TRANSCRIPTION_HOTKEY"
@@ -107,6 +112,10 @@ public actor ConfigurationManager {
                 sharedConfig[Constants.envGroqAPIKey] = key
             case .openAI:
                 sharedConfig[Constants.envOpenAIAPIKey] = key
+            case .azureSpeech:
+                sharedConfig[Constants.envAzureSpeechAPIKey] = key
+            case .openRouter:
+                sharedConfig[Constants.envOpenRouterAPIKey] = key
             case .elevenLabs:
                 sharedConfig[Constants.envElevenLabsAPIKey] = key
             case .whisperCpp:
@@ -146,6 +155,10 @@ public actor ConfigurationManager {
                 sharedConfig.removeValue(forKey: Constants.envGroqAPIKey)
             case .openAI:
                 sharedConfig.removeValue(forKey: Constants.envOpenAIAPIKey)
+            case .azureSpeech:
+                sharedConfig.removeValue(forKey: Constants.envAzureSpeechAPIKey)
+            case .openRouter:
+                sharedConfig.removeValue(forKey: Constants.envOpenRouterAPIKey)
             case .elevenLabs:
                 sharedConfig.removeValue(forKey: Constants.envElevenLabsAPIKey)
             case .whisperCpp:
@@ -188,6 +201,10 @@ public actor ConfigurationManager {
                 sharedKeyName = Constants.envGroqAPIKey
             case .openAI:
                 sharedKeyName = Constants.envOpenAIAPIKey
+            case .azureSpeech:
+                sharedKeyName = Constants.envAzureSpeechAPIKey
+            case .openRouter:
+                sharedKeyName = Constants.envOpenRouterAPIKey
             case .elevenLabs:
                 sharedKeyName = Constants.envElevenLabsAPIKey
             case .whisperCpp:
@@ -310,6 +327,15 @@ public actor ConfigurationManager {
         if let model = shared[Constants.envElevenLabsModel]?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
             settings.provider.elevenLabsModel = model
         }
+        if let endpoint = shared[Constants.envAzureSpeechEndpoint]?.trimmingCharacters(in: .whitespacesAndNewlines), !endpoint.isEmpty {
+            settings.provider.azureSpeechEndpoint = endpoint
+        }
+        if let model = shared[Constants.envAzureSpeechModel]?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
+            settings.provider.azureSpeechModel = model
+        }
+        if let model = shared[Constants.envOpenRouterModel]?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
+            settings.provider.openRouterModel = model
+        }
 
         if let timeoutRaw = shared[Constants.envTimeout], let parsed = Int(timeoutRaw.trimmingCharacters(in: .whitespacesAndNewlines)) {
             settings.provider.timeoutSeconds = min(max(parsed, 1), 120)
@@ -365,6 +391,9 @@ public actor ConfigurationManager {
         shared[Constants.envWhisperCppModelPath] = settings.provider.whisperCppModelPath
         shared[Constants.envWhisperCppRuntime] = settings.provider.whisperCppRuntime.rawValue
         shared[Constants.envElevenLabsModel] = settings.provider.elevenLabsModel
+        shared[Constants.envAzureSpeechEndpoint] = settings.provider.azureSpeechEndpoint
+        shared[Constants.envAzureSpeechModel] = settings.provider.azureSpeechModel
+        shared[Constants.envOpenRouterModel] = settings.provider.openRouterModel
         shared[Constants.envTimeout] = String(settings.provider.timeoutSeconds)
         shared[Constants.envVocabulary] = settings.vocabularyHints.joined(separator: ",")
 
@@ -420,6 +449,11 @@ public actor ConfigurationManager {
         let orderedKeys: [String] = [
             Constants.envGroqAPIKey,
             Constants.envOpenAIAPIKey,
+            Constants.envAzureSpeechAPIKey,
+            Constants.envAzureSpeechEndpoint,
+            Constants.envAzureSpeechModel,
+            Constants.envOpenRouterAPIKey,
+            Constants.envOpenRouterModel,
             Constants.envElevenLabsAPIKey,
             Constants.envToggleHotkey,
             Constants.envRetryHotkey,
@@ -540,6 +574,10 @@ public actor ConfigurationManager {
             return provider.groqModel
         case .openAI:
             return provider.openAIModel
+        case .azureSpeech:
+            return provider.azureSpeechModel
+        case .openRouter:
+            return provider.openRouterModel
         case .whisperCpp:
             return provider.whisperCppModelPath
         case .elevenLabs:
@@ -604,6 +642,14 @@ public actor ConfigurationManager {
             issues.append(SettingsValidationIssue(field: "provider.openAIModel", message: "OpenAI model must not be empty"))
         }
 
+        if settings.provider.azureSpeechModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            issues.append(SettingsValidationIssue(field: "provider.azureSpeechModel", message: "Azure Speech model must not be empty"))
+        }
+
+        if settings.provider.openRouterModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            issues.append(SettingsValidationIssue(field: "provider.openRouterModel", message: "OpenRouter model must not be empty"))
+        }
+
         if settings.provider.elevenLabsModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             issues.append(SettingsValidationIssue(field: "provider.elevenLabsModel", message: "ElevenLabs model must not be empty"))
         }
@@ -666,6 +712,17 @@ public actor ConfigurationManager {
             )
         }
 
+        let usesAzureSpeech = settings.provider.primary == .azureSpeech || settings.provider.fallback == .azureSpeech
+        let hasAzureSpeechProfile = settings.recordingProfiles.contains { $0.provider == .azureSpeech || $0.fallbackProvider == .azureSpeech }
+        if (usesAzureSpeech || hasAzureSpeechProfile), settings.provider.azureSpeechEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            issues.append(
+                SettingsValidationIssue(
+                    field: "provider.azureSpeechEndpoint",
+                    message: "Azure Speech endpoint must not be empty when Azure Speech is enabled"
+                )
+            )
+        }
+
         if issues.isEmpty {
             return
         }
@@ -687,6 +744,9 @@ public actor ConfigurationManager {
             "timeoutSeconds": String(settings.provider.timeoutSeconds),
             "groqModel": settings.provider.groqModel,
             "openAIModel": settings.provider.openAIModel,
+            "azureSpeechEndpoint": settings.provider.azureSpeechEndpoint,
+            "azureSpeechModel": settings.provider.azureSpeechModel,
+            "openRouterModel": settings.provider.openRouterModel,
             "whisperCppModelPath": settings.provider.whisperCppModelPath,
             "whisperCppRuntime": settings.provider.whisperCppRuntime.rawValue,
             "elevenLabsModel": settings.provider.elevenLabsModel,

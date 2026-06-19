@@ -20,6 +20,7 @@ actor AppControllerActor {
     private var isRecording = false
     private var latestAudio: AudioCaptureResult?
     private var activeRecordingProfile: RecordingShortcutProfile?
+    private var latestErrorDetail: String?
 
     init(
         configurationManager: ConfigurationManager,
@@ -174,14 +175,14 @@ actor AppControllerActor {
         guard let code = snapshot.lastErrorCode else {
             if let degradedReason = snapshot.degradedReason {
                 let mapped = messageForDegradedReason(degradedReason)
-                return "code=none\nphase=\(snapshot.phase.rawValue)\ndegradedReason=\(degradedReason.rawValue)\n\n\(mapped)"
+                return "\(mapped)\n\nTechnical: phase \(snapshot.phase.rawValue), reason \(degradedReason.rawValue)"
             }
             return "No recent error recorded."
         }
 
-        let mapped = messageForErrorCode(code)
+        let mapped = latestErrorDetail ?? messageForErrorCode(code)
         let degraded = snapshot.degradedReason?.rawValue ?? "none"
-        return "code=\(code)\nphase=\(snapshot.phase.rawValue)\ndegradedReason=\(degraded)\n\n\(mapped)"
+        return "\(mapped)\n\nTechnical: code \(code), phase \(snapshot.phase.rawValue), degraded \(degraded)"
     }
 
     func handleHotkey(actionID: String, event: HotkeyEvent) async {
@@ -270,6 +271,7 @@ actor AppControllerActor {
 
         let sessionID = UUID()
         do {
+            latestErrorDetail = nil
             activeRecordingProfile = profile
             try await lifecycle.beginSession(id: sessionID)
             try await lifecycle.transition(to: .arming)
@@ -316,6 +318,7 @@ actor AppControllerActor {
             return
         }
 
+        var failureStage = "audio capture"
         do {
             try await lifecycle.transition(to: .processing)
             await pushUI()
@@ -326,6 +329,7 @@ actor AppControllerActor {
 
             let start = Date()
             let transcriptionSettings = settingsForActiveRecordingProfile()
+            failureStage = "transcription"
             let pipelineResult = try await transcriptionPipeline.transcribe(
                 audioFileURL: capture.fileURL,
                 settings: transcriptionSettings,
@@ -341,6 +345,7 @@ actor AppControllerActor {
             try await lifecycle.transition(to: .outputting)
             await pushUI()
 
+            failureStage = "output"
             _ = try await outputRouter.route(text: pipelineResult.text, mode: settings.outputMode, profile: settings.buildProfile)
 
             let sessionID = capture.sessionID
@@ -357,6 +362,7 @@ actor AppControllerActor {
                 audioPath: capture.fileURL
             )
 
+            failureStage = "history save"
             try await historyStore.saveSession(record)
             await diagnostics.recordMetric(
                 MetricPoint(
@@ -369,9 +375,31 @@ actor AppControllerActor {
             try await lifecycle.transition(to: .ready)
             await lifecycle.endSession()
             activeRecordingProfile = nil
+            latestErrorDetail = nil
             await pushUI()
         } catch {
             isRecording = false
+            let failedSettings = settingsForActiveRecordingProfile()
+            let failedOverrides = modelOverridesForActiveRecordingProfile()
+            let detail: String
+            if failureStage == "transcription" {
+                detail = transcriptionFailureMessage(error: error, settings: failedSettings, modelOverrides: failedOverrides)
+            } else {
+                detail = workflowFailureMessage(stage: failureStage, error: error)
+            }
+            latestErrorDetail = detail
+            await diagnostics.emit(
+                DiagnosticEvent(
+                    name: "recording_flow_failed",
+                    sessionID: latestAudio?.sessionID,
+                    attributes: [
+                        "stage": failureStage,
+                        "primary": failedSettings.provider.primary.rawValue,
+                        "fallback": failedSettings.provider.fallback.rawValue,
+                        "error": sanitizedDiagnostic(error)
+                    ]
+                )
+            )
             activeRecordingProfile = nil
             try? await lifecycle.transition(to: .retryAvailable)
             await lifecycle.setLastErrorCode("pipeline_failed")
@@ -397,9 +425,27 @@ actor AppControllerActor {
 
             try await lifecycle.transition(to: .ready)
             await lifecycle.endSession()
+            latestErrorDetail = nil
             await pushUI()
         } catch {
+            latestErrorDetail = transcriptionFailureMessage(
+                error: error,
+                settings: settings,
+                modelOverrides: TranscriptionModelOverrides()
+            )
+            await diagnostics.emit(
+                DiagnosticEvent(
+                    name: "transcription_retry_failed",
+                    sessionID: latestAudio.sessionID,
+                    attributes: [
+                        "primary": settings.provider.primary.rawValue,
+                        "fallback": settings.provider.fallback.rawValue,
+                        "error": sanitizedDiagnostic(error)
+                    ]
+                )
+            )
             try? await lifecycle.transition(to: .retryAvailable)
+            await lifecycle.setLastErrorCode("pipeline_failed")
             await lifecycle.endSession()
             await pushUI()
         }
@@ -421,10 +467,15 @@ actor AppControllerActor {
             fallback: previous.provider.primary,
             groqAPIKeyRef: previous.provider.groqAPIKeyRef,
             openAIAPIKeyRef: previous.provider.openAIAPIKeyRef,
+            azureSpeechAPIKeyRef: previous.provider.azureSpeechAPIKeyRef,
+            openRouterAPIKeyRef: previous.provider.openRouterAPIKeyRef,
             elevenLabsAPIKeyRef: previous.provider.elevenLabsAPIKeyRef,
             timeoutSeconds: previous.provider.timeoutSeconds,
             groqModel: previous.provider.groqModel,
             openAIModel: previous.provider.openAIModel,
+            azureSpeechEndpoint: previous.provider.azureSpeechEndpoint,
+            azureSpeechModel: previous.provider.azureSpeechModel,
+            openRouterModel: previous.provider.openRouterModel,
             whisperCppModelPath: previous.provider.whisperCppModelPath,
             whisperCppRuntime: previous.provider.whisperCppRuntime,
             elevenLabsModel: previous.provider.elevenLabsModel
@@ -565,6 +616,10 @@ actor AppControllerActor {
             effective.provider.groqModel = profile.model
         case .openAI:
             effective.provider.openAIModel = profile.model
+        case .azureSpeech:
+            effective.provider.azureSpeechModel = profile.model
+        case .openRouter:
+            effective.provider.openRouterModel = profile.model
         case .whisperCpp:
             effective.provider.whisperCppModelPath = profile.model
         case .elevenLabs:
@@ -612,6 +667,120 @@ actor AppControllerActor {
         )
         await pushUI()
         return true
+    }
+
+    private func transcriptionFailureMessage(
+        error: Error,
+        settings: AppSettings,
+        modelOverrides: TranscriptionModelOverrides
+    ) -> String {
+        let header = "Transcription failed."
+        let nextSteps = """
+
+Next steps:
+- Check the selected provider keys and model names in Preferences -> Provider Setup.
+- Try the fallback provider or switch the recording profile to a provider with a stored key.
+- Run Checks from the menu bar after changing provider settings.
+"""
+
+        if case let TranscriptionPipelineError.retryAvailable(
+            primary,
+            fallback,
+            primaryErrorDescription,
+            fallbackErrorDescription
+        ) = error {
+            return """
+            \(header)
+
+            Primary: \(providerLabel(primary)) (\(modelLabel(for: primary, settings: settings, override: modelOverrides.primaryModel)))
+            Reason: \(primaryErrorDescription)
+
+            Fallback: \(providerLabel(fallback)) (\(modelLabel(for: fallback, settings: settings, override: modelOverrides.fallbackModel)))
+            Reason: \(fallbackErrorDescription)
+            \(nextSteps)
+            """
+        }
+
+        if let pipelineError = error as? TranscriptionPipelineError {
+            return "\(header)\n\nReason: \(pipelineError.diagnosticDescription)\(nextSteps)"
+        }
+
+        if let providerError = error as? ProviderError {
+            return "\(header)\n\nReason: \(providerError.diagnosticDescription)\(nextSteps)"
+        }
+
+        return "\(header)\n\nReason: \(String(describing: error))\(nextSteps)"
+    }
+
+    private func workflowFailureMessage(stage: String, error: Error) -> String {
+        """
+        \(stage.capitalized) failed.
+
+        Reason: \(sanitizedDiagnostic(error))
+
+        Next steps:
+        - Retry the last recording from the menu bar.
+        - If this repeats, run Checks from the menu bar and export diagnostics.
+        """
+    }
+
+    private func providerLabel(_ provider: ProviderKind) -> String {
+        switch provider {
+        case .groq:
+            return "Groq"
+        case .openAI:
+            return "OpenAI"
+        case .azureSpeech:
+            return "Azure Speech"
+        case .openRouter:
+            return "OpenRouter"
+        case .whisperCpp:
+            return "whisper.cpp"
+        case .elevenLabs:
+            return "ElevenLabs"
+        }
+    }
+
+    private func modelLabel(for provider: ProviderKind, settings: AppSettings, override: String?) -> String {
+        let value: String
+        if let override, !override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            value = override
+        } else {
+            switch provider {
+            case .groq:
+                value = settings.provider.groqModel
+            case .openAI:
+                value = settings.provider.openAIModel
+            case .azureSpeech:
+                value = settings.provider.azureSpeechModel
+            case .openRouter:
+                value = settings.provider.openRouterModel
+            case .whisperCpp:
+                value = settings.provider.whisperCppModelPath
+            case .elevenLabs:
+                value = settings.provider.elevenLabsModel
+            }
+        }
+
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "no model configured" : trimmed
+    }
+
+    private func sanitizedDiagnostic(_ error: Error) -> String {
+        let raw: String
+        if let pipelineError = error as? TranscriptionPipelineError {
+            raw = pipelineError.diagnosticDescription
+        } else if let providerError = error as? ProviderError {
+            raw = providerError.diagnosticDescription
+        } else {
+            raw = String(describing: error)
+        }
+        return String(
+            raw
+                .replacingOccurrences(of: "\n", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .prefix(800)
+        )
     }
 
     private func messageForErrorCode(_ code: String) -> String {

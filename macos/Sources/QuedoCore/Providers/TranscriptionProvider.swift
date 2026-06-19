@@ -56,6 +56,32 @@ public enum ProviderError: Error, Sendable {
     case invalidResponse
 }
 
+public extension ProviderError {
+    /// Human-readable diagnostic summary.
+    var diagnosticDescription: String {
+        switch self {
+        case .timeout:
+            return "timed out"
+        case .networkFailure:
+            return "network request failed"
+        case let .transient(statusCode):
+            return "temporary HTTP \(statusCode)"
+        case let .terminal(statusCode, message):
+            let cleaned = message
+                .replacingOccurrences(of: "\n", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if cleaned.isEmpty {
+                return "HTTP \(statusCode)"
+            }
+            return "HTTP \(statusCode): \(String(cleaned.prefix(500)))"
+        case .missingAPIKey:
+            return "missing API key"
+        case .invalidResponse:
+            return "invalid response from provider"
+        }
+    }
+}
+
 /// Transcription provider protocol.
 public protocol TranscriptionProvider: Sendable {
     /// Provider kind.

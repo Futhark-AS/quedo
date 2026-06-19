@@ -326,6 +326,27 @@ struct PreferencesView: View {
                         .frame(maxWidth: 340)
                 }
 
+                settingRow("Azure Speech endpoint") {
+                    TextField("https://<resource>.cognitiveservices.azure.com", text: $model.azureSpeechEndpoint)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(maxWidth: 520)
+                }
+
+                settingRow("Azure Speech model") {
+                    TextField("mai-transcribe-1.5", text: $model.azureSpeechModel)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(maxWidth: 340)
+                }
+
+                settingRow("OpenRouter model") {
+                    TextField("microsoft/mai-transcribe-1.5", text: $model.openRouterModel)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(maxWidth: 420)
+                }
+
                 settingRow("ElevenLabs model") {
                     TextField("scribe_v2", text: $model.elevenLabsModel)
                         .textFieldStyle(.roundedBorder)
@@ -523,6 +544,88 @@ struct PreferencesView: View {
                     }
                     .buttonStyle(.bordered)
                     .disabled(!model.hasOpenAIKey || model.isSaving)
+                }
+            }
+
+            PreferencesCard(
+                title: "Azure Speech",
+                subtitle: "Required when Azure Speech / MAI-Transcribe is selected."
+            ) {
+                settingRow("API key") {
+                    HStack(spacing: 8) {
+                        SecureField("Paste new key (optional)", text: $model.azureSpeechAPIKeyInput)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: 400)
+
+                        Label(
+                            model.hasAzureSpeechKey ? "Stored" : "Missing",
+                            systemImage: model.hasAzureSpeechKey ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                        )
+                        .font(.callout)
+                        .foregroundStyle(model.hasAzureSpeechKey ? Color.accentColor : Color.orange)
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    Button("Paste") {
+                        model.pasteAPIKey(.azureSpeech)
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button("Clear Input") {
+                        model.clearAPIKeyInput(.azureSpeech)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.azureSpeechAPIKeyInput.isEmpty)
+
+                    Spacer()
+
+                    Button("Remove Stored Key", role: .destructive) {
+                        Task { await model.clearStoredAPIKey(.azureSpeech) }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!model.hasAzureSpeechKey || model.isSaving)
+                }
+            }
+
+            PreferencesCard(
+                title: "OpenRouter",
+                subtitle: "Used by recording profiles that select OpenRouter."
+            ) {
+                settingRow("API key") {
+                    HStack(spacing: 8) {
+                        SecureField("Paste new key (optional)", text: $model.openRouterAPIKeyInput)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: 400)
+
+                        Label(
+                            model.hasOpenRouterKey ? "Stored" : "Missing",
+                            systemImage: model.hasOpenRouterKey ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                        )
+                        .font(.callout)
+                        .foregroundStyle(model.hasOpenRouterKey ? Color.accentColor : Color.orange)
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    Button("Paste") {
+                        model.pasteAPIKey(.openRouter)
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button("Clear Input") {
+                        model.clearAPIKeyInput(.openRouter)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.openRouterAPIKeyInput.isEmpty)
+
+                    Spacer()
+
+                    Button("Remove Stored Key", role: .destructive) {
+                        Task { await model.clearStoredAPIKey(.openRouter) }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!model.hasOpenRouterKey || model.isSaving)
                 }
             }
 
@@ -822,6 +925,10 @@ struct PreferencesView: View {
             return "Groq"
         case .openAI:
             return "OpenAI"
+        case .azureSpeech:
+            return "Azure Speech"
+        case .openRouter:
+            return "OpenRouter"
         case .whisperCpp:
             return "whisper.cpp"
         case .elevenLabs:
@@ -861,6 +968,9 @@ final class PreferencesViewModel: ObservableObject {
     @Published var timeoutSeconds = 12
     @Published var groqModel = "whisper-large-v3"
     @Published var openAIModel = "gpt-4o-mini-transcribe"
+    @Published var azureSpeechEndpoint = ""
+    @Published var azureSpeechModel = "mai-transcribe-1.5"
+    @Published var openRouterModel = "microsoft/mai-transcribe-1.5"
     @Published var whisperCppModelPath = "ggml-large-v3.bin"
     @Published var whisperCppRuntime: WhisperCppRuntime = .auto
     @Published var elevenLabsModel = "scribe_v2"
@@ -887,9 +997,13 @@ final class PreferencesViewModel: ObservableObject {
 
     @Published var groqAPIKeyInput = ""
     @Published var openAIAPIKeyInput = ""
+    @Published var azureSpeechAPIKeyInput = ""
+    @Published var openRouterAPIKeyInput = ""
     @Published var elevenLabsAPIKeyInput = ""
     @Published var hasGroqKey = false
     @Published var hasOpenAIKey = false
+    @Published var hasAzureSpeechKey = false
+    @Published var hasOpenRouterKey = false
     @Published var hasElevenLabsKey = false
     @Published var isSaving = false
 
@@ -974,6 +1088,8 @@ final class PreferencesViewModel: ObservableObject {
         let loaded = snapshot(from: loadedSettings)
         let hasPendingAPIInput = !normalize(groqAPIKeyInput).isEmpty
             || !normalize(openAIAPIKeyInput).isEmpty
+            || !normalize(azureSpeechAPIKeyInput).isEmpty
+            || !normalize(openRouterAPIKeyInput).isEmpty
             || !normalize(elevenLabsAPIKeyInput).isEmpty
         return current != loaded || hasPendingAPIInput
     }
@@ -1110,6 +1226,10 @@ final class PreferencesViewModel: ObservableObject {
             groqAPIKeyInput = ""
         case .openAI:
             openAIAPIKeyInput = ""
+        case .azureSpeech:
+            azureSpeechAPIKeyInput = ""
+        case .openRouter:
+            openRouterAPIKeyInput = ""
         case .elevenLabs:
             elevenLabsAPIKeyInput = ""
         case .whisperCpp:
@@ -1147,6 +1267,10 @@ final class PreferencesViewModel: ObservableObject {
             groqAPIKeyInput = value
         case .openAI:
             openAIAPIKeyInput = value
+        case .azureSpeech:
+            azureSpeechAPIKeyInput = value
+        case .openRouter:
+            openRouterAPIKeyInput = value
         case .elevenLabs:
             elevenLabsAPIKeyInput = value
         case .whisperCpp:
@@ -1215,6 +1339,10 @@ final class PreferencesViewModel: ObservableObject {
             return normalize(groqModel).isEmpty ? ProviderConfiguration.defaultValue.groqModel : normalize(groqModel)
         case .openAI:
             return normalize(openAIModel).isEmpty ? ProviderConfiguration.defaultValue.openAIModel : normalize(openAIModel)
+        case .azureSpeech:
+            return normalize(azureSpeechModel).isEmpty ? ProviderConfiguration.defaultValue.azureSpeechModel : normalize(azureSpeechModel)
+        case .openRouter:
+            return normalize(openRouterModel).isEmpty ? ProviderConfiguration.defaultValue.openRouterModel : normalize(openRouterModel)
         case .whisperCpp:
             return normalize(whisperCppModelPath).isEmpty ? ProviderConfiguration.defaultValue.whisperCppModelPath : normalize(whisperCppModelPath)
         case .elevenLabs:
@@ -1278,6 +1406,14 @@ final class PreferencesViewModel: ObservableObject {
                 hasOpenAIKey = false
                 openAIAPIKeyInput = ""
                 statusMessage = "OpenAI key removed."
+            case .azureSpeech:
+                hasAzureSpeechKey = false
+                azureSpeechAPIKeyInput = ""
+                statusMessage = "Azure Speech key removed."
+            case .openRouter:
+                hasOpenRouterKey = false
+                openRouterAPIKeyInput = ""
+                statusMessage = "OpenRouter key removed."
             case .elevenLabs:
                 hasElevenLabsKey = false
                 elevenLabsAPIKeyInput = ""
@@ -1300,9 +1436,13 @@ final class PreferencesViewModel: ObservableObject {
 
             groqAPIKeyInput = ""
             openAIAPIKeyInput = ""
+            azureSpeechAPIKeyInput = ""
+            openRouterAPIKeyInput = ""
             elevenLabsAPIKeyInput = ""
             hasGroqKey = (try await configurationManager.loadAPIKey(for: .groq)) != nil
             hasOpenAIKey = (try await configurationManager.loadAPIKey(for: .openAI)) != nil
+            hasAzureSpeechKey = (try await configurationManager.loadAPIKey(for: .azureSpeech)) != nil
+            hasOpenRouterKey = (try await configurationManager.loadAPIKey(for: .openRouter)) != nil
             hasElevenLabsKey = (try await configurationManager.loadAPIKey(for: .elevenLabs)) != nil
             refreshWhisperCppModels()
 
@@ -1318,6 +1458,8 @@ final class PreferencesViewModel: ObservableObject {
         apply(settings: .default)
         groqAPIKeyInput = ""
         openAIAPIKeyInput = ""
+        azureSpeechAPIKeyInput = ""
+        openRouterAPIKeyInput = ""
         elevenLabsAPIKeyInput = ""
         refreshWhisperCppModels()
         statusMessage = "Defaults loaded. Save to apply."
@@ -1328,6 +1470,8 @@ final class PreferencesViewModel: ObservableObject {
         apply(settings: loadedSettings)
         groqAPIKeyInput = ""
         openAIAPIKeyInput = ""
+        azureSpeechAPIKeyInput = ""
+        openRouterAPIKeyInput = ""
         elevenLabsAPIKeyInput = ""
         refreshWhisperCppModels()
         statusMessage = "Changes discarded."
@@ -1375,6 +1519,9 @@ final class PreferencesViewModel: ObservableObject {
         loadedSettings.provider.timeoutSeconds = timeoutSeconds
         loadedSettings.provider.groqModel = normalize(groqModel)
         loadedSettings.provider.openAIModel = normalize(openAIModel)
+        loadedSettings.provider.azureSpeechEndpoint = normalize(azureSpeechEndpoint)
+        loadedSettings.provider.azureSpeechModel = normalize(azureSpeechModel)
+        loadedSettings.provider.openRouterModel = normalize(openRouterModel)
         loadedSettings.provider.whisperCppModelPath = normalize(whisperCppModelPath)
         loadedSettings.provider.whisperCppRuntime = whisperCppRuntime
         loadedSettings.provider.elevenLabsModel = normalize(elevenLabsModel)
@@ -1401,6 +1548,18 @@ final class PreferencesViewModel: ObservableObject {
                 openAIAPIKeyInput = ""
             }
 
+            let azureSpeechTrimmed = normalize(azureSpeechAPIKeyInput)
+            if !azureSpeechTrimmed.isEmpty {
+                try await configurationManager.saveAPIKey(azureSpeechTrimmed, for: .azureSpeech)
+                azureSpeechAPIKeyInput = ""
+            }
+
+            let openRouterTrimmed = normalize(openRouterAPIKeyInput)
+            if !openRouterTrimmed.isEmpty {
+                try await configurationManager.saveAPIKey(openRouterTrimmed, for: .openRouter)
+                openRouterAPIKeyInput = ""
+            }
+
             let elevenLabsTrimmed = normalize(elevenLabsAPIKeyInput)
             if !elevenLabsTrimmed.isEmpty {
                 try await configurationManager.saveAPIKey(elevenLabsTrimmed, for: .elevenLabs)
@@ -1409,6 +1568,8 @@ final class PreferencesViewModel: ObservableObject {
 
             hasGroqKey = (try await configurationManager.loadAPIKey(for: .groq)) != nil
             hasOpenAIKey = (try await configurationManager.loadAPIKey(for: .openAI)) != nil
+            hasAzureSpeechKey = (try await configurationManager.loadAPIKey(for: .azureSpeech)) != nil
+            hasOpenRouterKey = (try await configurationManager.loadAPIKey(for: .openRouter)) != nil
             hasElevenLabsKey = (try await configurationManager.loadAPIKey(for: .elevenLabs)) != nil
 
             statusMessage = "Saved and applied."
@@ -1657,6 +1818,9 @@ final class PreferencesViewModel: ObservableObject {
         timeoutSeconds = settings.provider.timeoutSeconds
         groqModel = settings.provider.groqModel
         openAIModel = settings.provider.openAIModel
+        azureSpeechEndpoint = settings.provider.azureSpeechEndpoint
+        azureSpeechModel = settings.provider.azureSpeechModel
+        openRouterModel = settings.provider.openRouterModel
         whisperCppModelPath = settings.provider.whisperCppModelPath
         whisperCppRuntime = settings.provider.whisperCppRuntime
         elevenLabsModel = settings.provider.elevenLabsModel
@@ -1677,6 +1841,9 @@ final class PreferencesViewModel: ObservableObject {
         let timeoutSeconds: Int
         let groqModel: String
         let openAIModel: String
+        let azureSpeechEndpoint: String
+        let azureSpeechModel: String
+        let openRouterModel: String
         let whisperCppModelPath: String
         let whisperCppRuntime: WhisperCppRuntime
         let elevenLabsModel: String
@@ -1697,6 +1864,9 @@ final class PreferencesViewModel: ObservableObject {
             timeoutSeconds: timeoutSeconds,
             groqModel: normalize(groqModel),
             openAIModel: normalize(openAIModel),
+            azureSpeechEndpoint: normalize(azureSpeechEndpoint),
+            azureSpeechModel: normalize(azureSpeechModel),
+            openRouterModel: normalize(openRouterModel),
             whisperCppModelPath: normalize(whisperCppModelPath),
             whisperCppRuntime: whisperCppRuntime,
             elevenLabsModel: normalize(elevenLabsModel),
@@ -1719,6 +1889,9 @@ final class PreferencesViewModel: ObservableObject {
             timeoutSeconds: settings.provider.timeoutSeconds,
             groqModel: normalize(settings.provider.groqModel),
             openAIModel: normalize(settings.provider.openAIModel),
+            azureSpeechEndpoint: normalize(settings.provider.azureSpeechEndpoint),
+            azureSpeechModel: normalize(settings.provider.azureSpeechModel),
+            openRouterModel: normalize(settings.provider.openRouterModel),
             whisperCppModelPath: normalize(settings.provider.whisperCppModelPath),
             whisperCppRuntime: settings.provider.whisperCppRuntime,
             elevenLabsModel: normalize(settings.provider.elevenLabsModel),

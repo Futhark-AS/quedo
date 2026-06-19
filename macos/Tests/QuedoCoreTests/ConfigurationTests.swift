@@ -246,4 +246,39 @@ final class ConfigurationTests: XCTestCase {
             XCTFail("Unexpected error: \(error)")
         }
     }
+
+    func testValidationRequiresAzureSpeechEndpointWhenSelected() async {
+        let suiteName = "ConfigurationTests-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Unable to create isolated UserDefaults suite")
+            return
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let manager = ConfigurationManager(userDefaults: defaults, sharedConfigEnabled: false)
+        var settings = AppSettings.default
+        settings.provider.primary = .azureSpeech
+        settings.provider.fallback = .openAI
+        settings.recordingProfiles = [
+            RecordingShortcutProfile(
+                id: "default",
+                name: "Default",
+                hotkey: RecordingShortcutProfile.defaultProfile.hotkey,
+                provider: .azureSpeech,
+                fallbackProvider: .openAI,
+                model: ProviderConfiguration.defaultValue.azureSpeechModel,
+                fallbackModel: ProviderConfiguration.defaultValue.openAIModel,
+                language: "auto"
+            )
+        ]
+
+        do {
+            try await manager.validate(settings: settings)
+            XCTFail("Expected Azure Speech endpoint validation error")
+        } catch let error as SettingsValidationErrorSet {
+            XCTAssertTrue(error.issues.contains { $0.field == "provider.azureSpeechEndpoint" })
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
 }

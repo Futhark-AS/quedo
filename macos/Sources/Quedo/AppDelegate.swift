@@ -119,6 +119,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let openAIProvider = OpenAIProvider(timeoutSeconds: bootSettings.provider.timeoutSeconds) {
             try await configurationManager.loadAPIKey(for: .openAI) ?? ""
         }
+        let azureSpeechProvider = AzureSpeechProvider(timeoutSeconds: bootSettings.provider.timeoutSeconds) {
+            try await configurationManager.loadAPIKey(for: .azureSpeech) ?? ""
+        } endpointProvider: {
+            try await configurationManager.loadSettings().provider.azureSpeechEndpoint
+        }
+        let openRouterProvider = OpenRouterProvider(timeoutSeconds: bootSettings.provider.timeoutSeconds) {
+            try await configurationManager.loadAPIKey(for: .openRouter) ?? ""
+        }
         let elevenLabsProvider = ElevenLabsProvider(timeoutSeconds: bootSettings.provider.timeoutSeconds) {
             try await configurationManager.loadAPIKey(for: .elevenLabs) ?? ""
         }
@@ -130,7 +138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try await configurationManager.loadSettings().provider.whisperCppRuntime
         }
         let transcriptionPipeline = TranscriptionPipeline(
-            providers: [groqProvider, openAIProvider, elevenLabsProvider, whisperCppProvider],
+            providers: [groqProvider, openAIProvider, azureSpeechProvider, openRouterProvider, elevenLabsProvider, whisperCppProvider],
             requestTimeoutSeconds: bootSettings.provider.timeoutSeconds
         )
 

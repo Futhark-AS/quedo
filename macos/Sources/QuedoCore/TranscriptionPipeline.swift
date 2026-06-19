@@ -6,9 +6,28 @@ public enum TranscriptionPipelineError: Error, Sendable {
     /// No provider instance for requested kind.
     case providerUnavailable(ProviderKind)
     /// Both primary and fallback providers failed.
-    case retryAvailable(primary: ProviderKind, fallback: ProviderKind)
+    case retryAvailable(
+        primary: ProviderKind,
+        fallback: ProviderKind,
+        primaryErrorDescription: String,
+        fallbackErrorDescription: String
+    )
     /// Audio file could not be chunked.
     case chunkingFailed
+}
+
+public extension TranscriptionPipelineError {
+    /// Human-readable diagnostic summary.
+    var diagnosticDescription: String {
+        switch self {
+        case let .providerUnavailable(provider):
+            return "\(provider.rawValue) provider is unavailable"
+        case let .retryAvailable(primary, fallback, primaryErrorDescription, fallbackErrorDescription):
+            return "\(primary.rawValue) failed (\(primaryErrorDescription)); \(fallback.rawValue) failed (\(fallbackErrorDescription))"
+        case .chunkingFailed:
+            return "audio chunking/conversion failed"
+        }
+    }
 }
 
 /// Finalized pipeline output.
@@ -136,6 +155,7 @@ public actor TranscriptionPipeline {
                     let cleaned = cleanup(text: text, replacements: replacements)
                     return TranscriptionPipelineResult(text: cleaned, providerUsed: preferredPrimary, fallbackUsed: false)
                 } catch {
+                    let primaryErrorDescription = describe(error)
                     do {
                         let fallbackChunks = try chunksForProvider(fallback)
                         let text = try await runChunks(
@@ -150,11 +170,17 @@ public actor TranscriptionPipeline {
                         let cleaned = cleanup(text: text, replacements: replacements)
                         return TranscriptionPipelineResult(text: cleaned, providerUsed: preferredFallback, fallbackUsed: true)
                     } catch {
-                        throw TranscriptionPipelineError.retryAvailable(primary: preferredPrimary, fallback: preferredFallback)
+                        throw TranscriptionPipelineError.retryAvailable(
+                            primary: preferredPrimary,
+                            fallback: preferredFallback,
+                            primaryErrorDescription: primaryErrorDescription,
+                            fallbackErrorDescription: describe(error)
+                        )
                     }
                 }
             }
 
+            let primaryErrorDescription = describe(error)
             do {
                 let fallbackChunks = try chunksForProvider(fallback)
                 let text = try await runChunks(
@@ -169,7 +195,12 @@ public actor TranscriptionPipeline {
                 let cleaned = cleanup(text: text, replacements: replacements)
                 return TranscriptionPipelineResult(text: cleaned, providerUsed: preferredFallback, fallbackUsed: true)
             } catch {
-                throw TranscriptionPipelineError.retryAvailable(primary: preferredPrimary, fallback: preferredFallback)
+                throw TranscriptionPipelineError.retryAvailable(
+                    primary: preferredPrimary,
+                    fallback: preferredFallback,
+                    primaryErrorDescription: primaryErrorDescription,
+                    fallbackErrorDescription: describe(error)
+                )
             }
         }
     }
@@ -418,6 +449,10 @@ public actor TranscriptionPipeline {
             return settings.provider.groqModel
         case .openAI:
             return settings.provider.openAIModel
+        case .azureSpeech:
+            return settings.provider.azureSpeechModel
+        case .openRouter:
+            return settings.provider.openRouterModel
         case .whisperCpp:
             return settings.provider.whisperCppModelPath
         case .elevenLabs:
@@ -436,6 +471,16 @@ public actor TranscriptionPipeline {
         case .terminal, .missingAPIKey, .invalidResponse:
             return false
         }
+    }
+
+    private func describe(_ error: Error) -> String {
+        if let providerError = error as? ProviderError {
+            return providerError.diagnosticDescription
+        }
+        if let pipelineError = error as? TranscriptionPipelineError {
+            return pipelineError.diagnosticDescription
+        }
+        return String(describing: error)
     }
 
     private func startPrimaryReprobe(provider: any TranscriptionProvider) {
