@@ -112,8 +112,8 @@ The shared config keys are `OPENROUTER_MODEL` and `OPENROUTER_API_KEY`.
 
 ### Listening to saved recordings
 
-Quedo stores the audio for successful sessions in its history store. In the macOS app, use `Play Last Recording`
-from the menu bar to hear the newest saved recording. From the CLI, use:
+Quedo stores the audio for successful sessions in its history store. In the macOS app, open History and use
+the `Play` button on a session row. From the CLI, use:
 
 ```bash
 quedo-cli history play 1

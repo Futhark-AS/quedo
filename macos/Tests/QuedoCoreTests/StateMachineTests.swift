@@ -118,9 +118,8 @@ final class StateMachineTests: XCTestCase {
         XCTAssertTrue(contract.actions.contains(.openSettings))
     }
 
-    func testReadyContractIncludesPlaybackAction() async {
+    func testReadyContractIncludesHistoryAction() async {
         let contract = LifecycleStateMachine.uiContract(for: .ready, degradedReason: nil)
         XCTAssertTrue(contract.actions.contains(.history))
-        XCTAssertTrue(contract.actions.contains(.playLastRecording))
     }
 }

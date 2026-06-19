@@ -44,6 +44,13 @@ struct HistoryView: View {
                             }
                         }
                         .buttonStyle(.bordered)
+
+                        Button("Play") {
+                            Task {
+                                await model.playAudio(sessionID: session.sessionID)
+                            }
+                        }
+                        .buttonStyle(.bordered)
                     }
 
                     HStack {
@@ -128,6 +135,7 @@ final class HistoryViewModel: ObservableObject {
     private let configurationManager: ConfigurationManager
     private let pageSize = 100
     private var currentLimit = 100
+    private var playbackSound: NSSound?
 
     init(
         historyStore: HistoryStore,
@@ -213,6 +221,40 @@ final class HistoryViewModel: ObservableObject {
             errorMessage = nil
         } catch {
             errorMessage = "Failed to copy transcript"
+        }
+    }
+
+    func playAudio(sessionID: UUID) async {
+        do {
+            guard let audioURL = try await historyStore.primaryAudioFileURL(sessionID: sessionID) else {
+                errorMessage = "No audio file found for this session"
+                return
+            }
+
+            guard FileManager.default.fileExists(atPath: audioURL.path) else {
+                errorMessage = "Audio file missing from disk"
+                return
+            }
+
+            playbackSound?.stop()
+            guard let sound = NSSound(contentsOf: audioURL, byReference: true) else {
+                errorMessage = "Failed to open audio file"
+                return
+            }
+
+            playbackSound = sound
+            statusMessage = "Playing recording"
+            errorMessage = nil
+
+            if !sound.play() {
+                playbackSound = nil
+                errorMessage = "Failed to start playback"
+                statusMessage = nil
+            }
+        } catch {
+            errorMessage = "Failed to play audio"
+            statusMessage = nil
+            playbackSound = nil
         }
     }
 

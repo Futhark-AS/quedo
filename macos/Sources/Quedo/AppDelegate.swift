@@ -15,7 +15,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var preferencesWindowController: NSWindowController?
     private var historyWindowController: NSWindowController?
     private var updaterController: SPUStandardUpdaterController?
-    private var playbackSound: NSSound?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = notification
@@ -187,10 +186,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     transcriptionPipeline: transcriptionPipeline,
                     configurationManager: configurationManager
                 )
-            case .playLastRecording:
-                Task {
-                    await self.playLastRecording(historyStore: historyStore)
-                }
             case .openSettings:
                 Task {
                     let permissions = await permissionCoordinator.checkAll()
@@ -395,39 +390,6 @@ Move the app to /Applications and reopen it. Running translocated can break perm
             return
         }
         NSWorkspace.shared.open(url)
-    }
-
-    private func playLastRecording(historyStore: HistoryStore) async {
-        do {
-            guard let session = try await historyStore.listSessions(limit: 1).first else {
-                presentInfoAlert(title: "No Recording Found", message: "Quedo has not saved any transcription audio yet.")
-                return
-            }
-            guard let audioURL = try await historyStore.primaryAudioFileURL(sessionID: session.sessionID) else {
-                presentInfoAlert(title: "No Audio Found", message: "The most recent history item has no saved audio file.")
-                return
-            }
-            guard FileManager.default.fileExists(atPath: audioURL.path) else {
-                presentInfoAlert(title: "Audio File Missing", message: audioURL.path)
-                return
-            }
-
-            playRecordingAudio(audioURL)
-        } catch {
-            presentInfoAlert(title: "Playback Failed", message: error.localizedDescription)
-        }
-    }
-
-    private func playRecordingAudio(_ audioURL: URL) {
-        playbackSound?.stop()
-        guard let sound = NSSound(contentsOf: audioURL, byReference: true) else {
-            presentInfoAlert(title: "Playback Failed", message: "Could not open audio file:\n\(audioURL.path)")
-            return
-        }
-        playbackSound = sound
-        if !sound.play() {
-            presentInfoAlert(title: "Playback Failed", message: "Could not start playback for:\n\(audioURL.path)")
-        }
     }
 
     private func revealDiagnosticsArchive(_ archiveURL: URL) {
