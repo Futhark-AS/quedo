@@ -73,8 +73,8 @@ public actor HistoryStore {
     private var db: OpaquePointer?
 
     /// Creates history store and initializes schema.
-    public init(fileManager: FileManager = .default) throws {
-        let resolvedBaseURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    public init(fileManager: FileManager = .default, baseURL: URL? = nil) throws {
+        let resolvedBaseURL = baseURL ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Quedo", isDirectory: true)
         let resolvedDBURL = resolvedBaseURL.appendingPathComponent("db/history.sqlite")
 

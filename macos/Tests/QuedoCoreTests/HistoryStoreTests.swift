@@ -3,7 +3,7 @@ import XCTest
 
 final class HistoryStoreTests: XCTestCase {
     func testSaveAndListSession() async throws {
-        let store = try HistoryStore()
+        let store = try makeIsolatedHistoryStore()
         let sessionID = UUID()
         let tempAudio = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("history-test-\(sessionID.uuidString).caf")
         try Data("audio".utf8).write(to: tempAudio)
@@ -37,7 +37,7 @@ final class HistoryStoreTests: XCTestCase {
     }
 
     func testPrimaryAudioFileURLReturnsNilWhenMissing() async throws {
-        let store = try HistoryStore()
+        let store = try makeIsolatedHistoryStore()
         let missing = try await store.primaryAudioFileURL(sessionID: UUID())
         XCTAssertNil(missing)
 
@@ -46,7 +46,7 @@ final class HistoryStoreTests: XCTestCase {
     }
 
     func testSaveSessionRemovesTemporarySourceAudio() async throws {
-        let store = try HistoryStore()
+        let store = try makeIsolatedHistoryStore()
         let sessionID = UUID()
         let tempAudio = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("history-test-cleanup-\(sessionID.uuidString).wav")
         try Data("audio".utf8).write(to: tempAudio)
@@ -67,5 +67,14 @@ final class HistoryStoreTests: XCTestCase {
 
         try await store.saveSession(record)
         XCTAssertFalse(FileManager.default.fileExists(atPath: tempAudio.path))
+    }
+
+    private func makeIsolatedHistoryStore() throws -> HistoryStore {
+        let baseURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("quedo-history-test-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: baseURL)
+        }
+        return try HistoryStore(baseURL: baseURL)
     }
 }
