@@ -426,14 +426,7 @@ public actor TranscriptionPipeline {
     }
 
     private func chunkWAVAudioIfNeeded(_ fileURL: URL) throws -> [URL]? {
-        let wavData: Data
-        do {
-            wavData = try Data(contentsOf: fileURL)
-        } catch {
-            throw TranscriptionPipelineError.chunkingFailed
-        }
-
-        guard let metadata = parseWAVMetadata(wavData) else {
+        guard let metadata = try parseWAVMetadata(fileURL) else {
             return nil
         }
 
@@ -459,6 +452,16 @@ public actor TranscriptionPipeline {
         var files: [URL] = []
         var createdPaths: [URL] = []
         var index = 0
+        let sourceHandle: FileHandle
+
+        do {
+            sourceHandle = try FileHandle(forReadingFrom: fileURL)
+        } catch {
+            throw TranscriptionPipelineError.chunkingFailed
+        }
+        defer {
+            try? sourceHandle.close()
+        }
 
         do {
             while remainingBytes > 0 {
@@ -469,14 +472,14 @@ public actor TranscriptionPipeline {
                 }
 
                 let endOffset = sourceOffset + Int(chunkBytes)
-                guard endOffset <= wavData.count else {
+                guard let audioData = readData(from: sourceHandle, offset: UInt64(sourceOffset), length: Int(chunkBytes)),
+                      endOffset <= metadata.dataOffset + metadata.dataSize else {
                     throw TranscriptionPipelineError.chunkingFailed
                 }
 
                 let path = tempRoot.appendingPathComponent("chunk-\(UUID().uuidString)-\(index).wav")
                 createdPaths.append(path)
 
-                let audioData = wavData.subdata(in: sourceOffset..<endOffset)
                 let chunkData = try makeWAVData(formatData: metadata.formatData, audioData: audioData)
                 try chunkData.write(to: path, options: .atomic)
 
@@ -493,29 +496,55 @@ public actor TranscriptionPipeline {
         return files
     }
 
-    private func parseWAVMetadata(_ data: Data) -> WAVMetadata? {
-        guard data.count >= 12,
-              asciiString(data, offset: 0, length: 4) == "RIFF",
-              asciiString(data, offset: 8, length: 4) == "WAVE" else {
+    private func parseWAVMetadata(_ fileURL: URL) throws -> WAVMetadata? {
+        let fileSize: UInt64
+        do {
+            let attributes = try fileManager.attributesOfItem(atPath: fileURL.path)
+            fileSize = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        } catch {
+            throw TranscriptionPipelineError.chunkingFailed
+        }
+
+        guard fileSize >= 12 else {
+            return nil
+        }
+
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forReadingFrom: fileURL)
+        } catch {
+            throw TranscriptionPipelineError.chunkingFailed
+        }
+        defer {
+            try? handle.close()
+        }
+
+        let riffHeader = handle.readData(ofLength: 12)
+        guard riffHeader.count == 12,
+              asciiString(riffHeader, offset: 0, length: 4) == "RIFF",
+              asciiString(riffHeader, offset: 8, length: 4) == "WAVE" else {
             return nil
         }
 
         var formatData: Data?
         var sampleRate: Double?
         var blockAlign: Int?
-        var dataOffset: Int?
-        var dataSize: Int?
-        var offset = 12
+        var dataOffset: UInt64?
+        var dataSize: UInt64?
+        var offset: UInt64 = 12
 
-        while offset + 8 <= data.count {
-            guard let chunkID = asciiString(data, offset: offset, length: 4) else {
+        while offset + 8 <= fileSize {
+            handle.seek(toFileOffset: offset)
+            let chunkHeader = handle.readData(ofLength: 8)
+            guard chunkHeader.count == 8,
+                  let chunkID = asciiString(chunkHeader, offset: 0, length: 4) else {
                 return nil
             }
 
-            let chunkSize = Int(readLittleEndianUInt32(data, offset: offset + 4))
+            let chunkSize = UInt64(readLittleEndianUInt32(chunkHeader, offset: 4))
             let payloadStart = offset + 8
             let payloadEnd = payloadStart + chunkSize
-            guard payloadEnd <= data.count else {
+            guard payloadEnd <= fileSize else {
                 return nil
             }
 
@@ -524,9 +553,12 @@ public actor TranscriptionPipeline {
                     return nil
                 }
 
-                formatData = data.subdata(in: payloadStart..<payloadEnd)
-                sampleRate = Double(readLittleEndianUInt32(data, offset: payloadStart + 4))
-                blockAlign = Int(readLittleEndianUInt16(data, offset: payloadStart + 12))
+                guard let currentFormatData = readData(from: handle, offset: payloadStart, length: Int(chunkSize)) else {
+                    return nil
+                }
+                formatData = currentFormatData
+                sampleRate = Double(readLittleEndianUInt32(currentFormatData, offset: 4))
+                blockAlign = Int(readLittleEndianUInt16(currentFormatData, offset: 12))
             } else if chunkID == "data" {
                 dataOffset = payloadStart
                 dataSize = chunkSize
@@ -541,7 +573,9 @@ public actor TranscriptionPipeline {
               let dataOffset,
               let dataSize,
               sampleRate > 0,
-              blockAlign > 0 else {
+              blockAlign > 0,
+              dataOffset <= UInt64(Int.max),
+              dataSize <= UInt64(Int.max) else {
             return nil
         }
 
@@ -549,9 +583,29 @@ public actor TranscriptionPipeline {
             formatData: formatData,
             sampleRate: sampleRate,
             blockAlign: blockAlign,
-            dataOffset: dataOffset,
-            dataSize: dataSize
+            dataOffset: Int(dataOffset),
+            dataSize: Int(dataSize)
         )
+    }
+
+    private func readData(from handle: FileHandle, offset: UInt64, length: Int) -> Data? {
+        guard length >= 0 else {
+            return nil
+        }
+        handle.seek(toFileOffset: offset)
+
+        var data = Data()
+        data.reserveCapacity(length)
+        var remaining = length
+        while remaining > 0 {
+            let part = handle.readData(ofLength: min(remaining, 1_048_576))
+            guard !part.isEmpty else {
+                return nil
+            }
+            data.append(part)
+            remaining -= part.count
+        }
+        return data
     }
 
     private func makeWAVData(formatData: Data, audioData: Data) throws -> Data {

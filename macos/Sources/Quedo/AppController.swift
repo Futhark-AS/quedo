@@ -21,6 +21,14 @@ actor AppControllerActor {
     private var latestAudio: AudioCaptureResult?
     private var activeRecordingProfile: RecordingShortcutProfile?
     private var latestErrorDetail: String?
+    private var latestRetryContext: TranscriptionRetryContext?
+    private var latestOutputText: String?
+
+    private struct TranscriptionRetryContext {
+        let settings: AppSettings
+        let modelOverrides: TranscriptionModelOverrides
+        let createdAt: Date
+    }
 
     init(
         configurationManager: ConfigurationManager,
@@ -319,6 +327,7 @@ actor AppControllerActor {
         }
 
         var failureStage = "audio capture"
+        var rawCaptureForRecovery: AudioCaptureResult?
         var persistedCapture: AudioCaptureResult?
         var transcriptionSettings = settingsForActiveRecordingProfile()
         var transcriptionOverrides = modelOverridesForActiveRecordingProfile()
@@ -327,6 +336,7 @@ actor AppControllerActor {
             await pushUI()
 
             let rawCapture = try await audioEngine.stopRecording()
+            rawCaptureForRecovery = rawCapture
             isRecording = false
 
             let start = Date()
@@ -356,6 +366,12 @@ actor AppControllerActor {
             )
             latestAudio = capture
             persistedCapture = capture
+            latestRetryContext = TranscriptionRetryContext(
+                settings: transcriptionSettings,
+                modelOverrides: transcriptionOverrides,
+                createdAt: capturedAt
+            )
+            latestOutputText = nil
 
             failureStage = "transcription"
             let pipelineResult = try await transcriptionPipeline.transcribe(
@@ -389,6 +405,7 @@ actor AppControllerActor {
                 fileURL: finalAudioURL,
                 durationMS: capture.durationMS
             )
+            latestOutputText = pipelineResult.text
 
             try await lifecycle.transition(to: .outputting)
             await pushUI()
@@ -407,6 +424,8 @@ actor AppControllerActor {
             await lifecycle.endSession()
             activeRecordingProfile = nil
             latestErrorDetail = nil
+            latestRetryContext = nil
+            latestOutputText = nil
             await pushUI()
         } catch {
             isRecording = false
@@ -434,7 +453,7 @@ actor AppControllerActor {
             if failureStage == "transcription", let persistedCapture {
                 let failedRecord = SessionRecord(
                     sessionID: persistedCapture.sessionID,
-                    createdAt: Date(),
+                    createdAt: latestRetryContext?.createdAt ?? Date(),
                     durationMS: persistedCapture.durationMS,
                     providerPrimary: failedSettings.provider.primary,
                     providerUsed: failedSettings.provider.primary,
@@ -445,6 +464,16 @@ actor AppControllerActor {
                     audioPath: persistedCapture.fileURL
                 )
                 _ = try? await historyStore.saveSession(failedRecord)
+            }
+            if failureStage == "history pre-save", let rawCaptureForRecovery {
+                if let recoveredURL = recoverAudioForManualImport(rawCaptureForRecovery) {
+                    latestAudio = AudioCaptureResult(
+                        sessionID: rawCaptureForRecovery.sessionID,
+                        fileURL: recoveredURL,
+                        durationMS: rawCaptureForRecovery.durationMS
+                    )
+                    latestErrorDetail = "\(detail)\n\nRecovered audio copy:\n\(recoveredURL.path)"
+                }
             }
             activeRecordingProfile = nil
             try? await lifecycle.transition(to: .retryAvailable)
@@ -459,21 +488,52 @@ actor AppControllerActor {
             return
         }
 
+        let snapshot = await lifecycle.snapshot()
+        if snapshot.lastErrorCode == "output_failed", let latestOutputText {
+            do {
+                try await lifecycle.transition(to: .outputting)
+                await pushUI()
+                _ = try await outputRouter.route(text: latestOutputText, mode: settings.outputMode, profile: settings.buildProfile)
+                try await lifecycle.transition(to: .ready)
+                await lifecycle.endSession()
+                latestErrorDetail = nil
+                self.latestOutputText = nil
+                await pushUI()
+            } catch {
+                latestErrorDetail = workflowFailureMessage(stage: "output", error: error)
+                await lifecycle.setLastErrorCode("output_failed")
+                try? await lifecycle.transition(to: .retryAvailable)
+                await lifecycle.endSession()
+                await pushUI()
+            }
+            return
+        }
+
+        var failureStage = "transcription"
+        let retryContext = latestRetryContext ?? TranscriptionRetryContext(
+            settings: settings,
+            modelOverrides: TranscriptionModelOverrides(),
+            createdAt: Date()
+        )
+
         do {
             try await lifecycle.transition(to: .processing)
             await pushUI()
 
-            let result = try await transcriptionPipeline.transcribe(audioFileURL: latestAudio.fileURL, settings: settings)
-            try await lifecycle.transition(to: .outputting)
-            await pushUI()
+            let result = try await transcriptionPipeline.transcribe(
+                audioFileURL: latestAudio.fileURL,
+                settings: retryContext.settings,
+                modelOverrides: retryContext.modelOverrides
+            )
 
+            failureStage = "history save"
             let record = SessionRecord(
                 sessionID: latestAudio.sessionID,
-                createdAt: Date(),
+                createdAt: retryContext.createdAt,
                 durationMS: latestAudio.durationMS,
-                providerPrimary: settings.provider.primary,
+                providerPrimary: retryContext.settings.provider.primary,
                 providerUsed: result.providerUsed,
-                language: settings.language,
+                language: retryContext.settings.language,
                 outputMode: settings.outputMode,
                 status: .success,
                 transcript: result.text,
@@ -486,31 +546,42 @@ actor AppControllerActor {
                 durationMS: latestAudio.durationMS
             )
 
+            latestOutputText = result.text
+            failureStage = "output"
+            try await lifecycle.transition(to: .outputting)
+            await pushUI()
+
             _ = try await outputRouter.route(text: result.text, mode: settings.outputMode, profile: settings.buildProfile)
 
             try await lifecycle.transition(to: .ready)
             await lifecycle.endSession()
             latestErrorDetail = nil
+            latestRetryContext = nil
+            latestOutputText = nil
             await pushUI()
         } catch {
-            latestErrorDetail = transcriptionFailureMessage(
-                error: error,
-                settings: settings,
-                modelOverrides: TranscriptionModelOverrides()
-            )
+            if failureStage == "transcription" {
+                latestErrorDetail = transcriptionFailureMessage(
+                    error: error,
+                    settings: retryContext.settings,
+                    modelOverrides: retryContext.modelOverrides
+                )
+            } else {
+                latestErrorDetail = workflowFailureMessage(stage: failureStage, error: error)
+            }
             await diagnostics.emit(
                 DiagnosticEvent(
                     name: "transcription_retry_failed",
                     sessionID: latestAudio.sessionID,
                     attributes: [
-                        "primary": settings.provider.primary.rawValue,
-                        "fallback": settings.provider.fallback.rawValue,
+                        "primary": retryContext.settings.provider.primary.rawValue,
+                        "fallback": retryContext.settings.provider.fallback.rawValue,
                         "error": sanitizedDiagnostic(error)
                     ]
                 )
             )
             try? await lifecycle.transition(to: .retryAvailable)
-            await lifecycle.setLastErrorCode("pipeline_failed")
+            await lifecycle.setLastErrorCode(errorCode(forFailureStage: failureStage))
             await lifecycle.endSession()
             await pushUI()
         }
@@ -787,6 +858,27 @@ Next steps:
         - Retry the last recording from the menu bar.
         - If this repeats, run Checks from the menu bar and export diagnostics.
         """
+    }
+
+    private func recoverAudioForManualImport(_ capture: AudioCaptureResult) -> URL? {
+        let fileManager = FileManager.default
+        let baseURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Quedo", isDirectory: true)
+        let recoveredDirectory = baseURL.appendingPathComponent("recovered", isDirectory: true)
+        let recoveredURL = recoveredDirectory
+            .appendingPathComponent("\(capture.sessionID.uuidString)-history-save-failed")
+            .appendingPathExtension(capture.fileURL.pathExtension.isEmpty ? "wav" : capture.fileURL.pathExtension)
+
+        do {
+            try fileManager.createDirectory(at: recoveredDirectory, withIntermediateDirectories: true)
+            if fileManager.fileExists(atPath: recoveredURL.path) {
+                try fileManager.removeItem(at: recoveredURL)
+            }
+            try fileManager.copyItem(at: capture.fileURL, to: recoveredURL)
+            return recoveredURL
+        } catch {
+            return nil
+        }
     }
 
     private func errorCode(forFailureStage stage: String) -> String {

@@ -272,6 +272,11 @@ final class HistoryViewModel: ObservableObject {
                 return
             }
 
+            guard let details = try await historyStore.sessionDetails(sessionID: sessionID) else {
+                errorMessage = "History session metadata missing"
+                return
+            }
+
             retranscribingSessionID = sessionID
             statusMessage = "Re-transcribing..."
             errorMessage = nil
@@ -279,14 +284,27 @@ final class HistoryViewModel: ObservableObject {
             let language = retranscribeLanguages[sessionID, default: "auto"]
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             var settings = try await configurationManager.loadSettings()
-            settings.language = language.isEmpty ? "auto" : language
+            settings.provider.primary = details.providerPrimary
+            settings.language = language.isEmpty ? details.language : language
 
             let result = try await transcriptionPipeline.transcribe(
                 audioFileURL: audioURL,
                 settings: settings
             )
 
-            try await historyStore.updateTranscript(sessionID: sessionID, text: result.text)
+            let record = SessionRecord(
+                sessionID: sessionID,
+                createdAt: details.createdAt,
+                durationMS: details.durationMS,
+                providerPrimary: details.providerPrimary,
+                providerUsed: result.providerUsed,
+                language: settings.language,
+                outputMode: details.outputMode,
+                status: .success,
+                transcript: result.text,
+                audioPath: audioURL
+            )
+            try await historyStore.saveSession(record)
             statusMessage = "Re-transcription complete"
             retranscribingSessionID = nil
             await load(reset: true)

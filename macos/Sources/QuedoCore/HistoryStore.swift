@@ -47,6 +47,47 @@ public struct HistorySessionSummary: Sendable {
     }
 }
 
+/// Full session metadata needed for retry/re-transcription flows.
+public struct HistorySessionDetails: Sendable {
+    /// Session identifier.
+    public let sessionID: UUID
+    /// Creation timestamp.
+    public let createdAt: Date
+    /// Duration in milliseconds.
+    public let durationMS: Int
+    /// Configured primary provider.
+    public let providerPrimary: ProviderKind
+    /// Provider used for output.
+    public let providerUsed: ProviderKind
+    /// Language used for transcription.
+    public let language: String
+    /// Output routing mode.
+    public let outputMode: OutputMode
+    /// Final session status.
+    public let status: SessionStatus
+
+    /// Creates full session metadata.
+    public init(
+        sessionID: UUID,
+        createdAt: Date,
+        durationMS: Int,
+        providerPrimary: ProviderKind,
+        providerUsed: ProviderKind,
+        language: String,
+        outputMode: OutputMode,
+        status: SessionStatus
+    ) {
+        self.sessionID = sessionID
+        self.createdAt = createdAt
+        self.durationMS = durationMS
+        self.providerPrimary = providerPrimary
+        self.providerUsed = providerUsed
+        self.language = language
+        self.outputMode = outputMode
+        self.status = status
+    }
+}
+
 /// Migration summary for legacy Python imports.
 public struct LegacyMigrationReport: Sendable {
     /// Number of legacy folders scanned.
@@ -101,39 +142,70 @@ public actor HistoryStore {
         legacySourcePath: String? = nil,
         legacyAudioFormat: String? = nil
     ) throws -> URL {
-        let persistedAudioPath = try persistAudioArtifact(sessionID: session.sessionID, sourcePath: session.audioPath)
+        let persistedAudio = try persistAudioArtifact(sessionID: session.sessionID, sourcePath: session.audioPath)
 
         try execute("BEGIN IMMEDIATE TRANSACTION")
         do {
-            let insertSession = try prepare(
+            let updateSession = try prepare(
                 """
-                INSERT OR REPLACE INTO sessions (
-                    session_id,
-                    created_at,
-                    duration_ms,
-                    provider_primary,
-                    provider_used,
-                    language,
-                    output_mode,
-                    status,
-                    legacy_source_path,
-                    legacy_audio_format
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                UPDATE sessions
+                SET created_at = ?,
+                    duration_ms = ?,
+                    provider_primary = ?,
+                    provider_used = ?,
+                    language = ?,
+                    output_mode = ?,
+                    status = ?,
+                    legacy_source_path = ?,
+                    legacy_audio_format = ?
+                WHERE session_id = ?;
                 """
             )
-            defer { sqlite3_finalize(insertSession) }
+            defer { sqlite3_finalize(updateSession) }
 
-            bindText(session.sessionID.uuidString, to: 1, in: insertSession)
-            bindDouble(session.createdAt.timeIntervalSince1970, to: 2, in: insertSession)
-            bindInt32(Int32(session.durationMS), to: 3, in: insertSession)
-            bindText(session.providerPrimary.rawValue, to: 4, in: insertSession)
-            bindText(session.providerUsed.rawValue, to: 5, in: insertSession)
-            bindText(session.language, to: 6, in: insertSession)
-            bindText(session.outputMode.rawValue, to: 7, in: insertSession)
-            bindText(session.status.rawValue, to: 8, in: insertSession)
-            bindOptionalText(legacySourcePath, to: 9, in: insertSession)
-            bindOptionalText(legacyAudioFormat, to: 10, in: insertSession)
-            try stepDone(insertSession)
+            bindDouble(session.createdAt.timeIntervalSince1970, to: 1, in: updateSession)
+            bindInt32(Int32(session.durationMS), to: 2, in: updateSession)
+            bindText(session.providerPrimary.rawValue, to: 3, in: updateSession)
+            bindText(session.providerUsed.rawValue, to: 4, in: updateSession)
+            bindText(session.language, to: 5, in: updateSession)
+            bindText(session.outputMode.rawValue, to: 6, in: updateSession)
+            bindText(session.status.rawValue, to: 7, in: updateSession)
+            bindOptionalText(legacySourcePath, to: 8, in: updateSession)
+            bindOptionalText(legacyAudioFormat, to: 9, in: updateSession)
+            bindText(session.sessionID.uuidString, to: 10, in: updateSession)
+            try stepDone(updateSession)
+
+            if sqlite3_changes(db) == 0 {
+                let insertSession = try prepare(
+                    """
+                    INSERT INTO sessions (
+                        session_id,
+                        created_at,
+                        duration_ms,
+                        provider_primary,
+                        provider_used,
+                        language,
+                        output_mode,
+                        status,
+                        legacy_source_path,
+                        legacy_audio_format
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """
+                )
+                defer { sqlite3_finalize(insertSession) }
+
+                bindText(session.sessionID.uuidString, to: 1, in: insertSession)
+                bindDouble(session.createdAt.timeIntervalSince1970, to: 2, in: insertSession)
+                bindInt32(Int32(session.durationMS), to: 3, in: insertSession)
+                bindText(session.providerPrimary.rawValue, to: 4, in: insertSession)
+                bindText(session.providerUsed.rawValue, to: 5, in: insertSession)
+                bindText(session.language, to: 6, in: insertSession)
+                bindText(session.outputMode.rawValue, to: 7, in: insertSession)
+                bindText(session.status.rawValue, to: 8, in: insertSession)
+                bindOptionalText(legacySourcePath, to: 9, in: insertSession)
+                bindOptionalText(legacyAudioFormat, to: 10, in: insertSession)
+                try stepDone(insertSession)
+            }
 
             let deletePrimaryMediaStatement = try prepare(
                 """
@@ -161,7 +233,7 @@ public actor HistoryStore {
             bindText(UUID().uuidString, to: 1, in: mediaStatement)
             bindText(session.sessionID.uuidString, to: 2, in: mediaStatement)
             bindText("audio", to: 3, in: mediaStatement)
-            bindText(persistedAudioPath.path, to: 4, in: mediaStatement)
+            bindText(persistedAudio.url.path, to: 4, in: mediaStatement)
             bindInt32(1, to: 5, in: mediaStatement)
             try stepDone(mediaStatement)
 
@@ -189,7 +261,11 @@ public actor HistoryStore {
             throw error
         }
 
-        return persistedAudioPath
+        if persistedAudio.deleteSourceAfterCommit {
+            try? fileManager.removeItem(at: session.audioPath)
+        }
+
+        return persistedAudio.url
     }
 
     /// Appends a structured session event entry.
@@ -301,6 +377,57 @@ public actor HistoryStore {
         }
 
         return sqlite3_column_text(statement, 0).map { String(cString: $0) } ?? ""
+    }
+
+    /// Returns full persisted metadata for a session when available.
+    public func sessionDetails(sessionID: UUID) throws -> HistorySessionDetails? {
+        let statement = try prepare(
+            """
+            SELECT created_at, duration_ms, provider_primary, provider_used, language, output_mode, status
+            FROM sessions
+            WHERE session_id = ?
+            LIMIT 1;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+
+        bindText(sessionID.uuidString, to: 1, in: statement)
+        guard sqlite3_step(statement) == SQLITE_ROW,
+              let primaryCString = sqlite3_column_text(statement, 2),
+              let usedCString = sqlite3_column_text(statement, 3),
+              let languageCString = sqlite3_column_text(statement, 4),
+              let outputCString = sqlite3_column_text(statement, 5),
+              let statusCString = sqlite3_column_text(statement, 6)
+        else {
+            return nil
+        }
+
+        let createdAt = sqlite3_column_double(statement, 0)
+        let duration = sqlite3_column_int(statement, 1)
+        let primary = String(cString: primaryCString)
+        let used = String(cString: usedCString)
+        let language = String(cString: languageCString)
+        let output = String(cString: outputCString)
+        let status = String(cString: statusCString)
+
+        guard let primaryProvider = ProviderKind(rawValue: primary),
+              let usedProvider = ProviderKind(rawValue: used),
+              let outputMode = OutputMode(rawValue: output),
+              let sessionStatus = SessionStatus(rawValue: status)
+        else {
+            return nil
+        }
+
+        return HistorySessionDetails(
+            sessionID: sessionID,
+            createdAt: Date(timeIntervalSince1970: createdAt),
+            durationMS: Int(duration),
+            providerPrimary: primaryProvider,
+            providerUsed: usedProvider,
+            language: language,
+            outputMode: outputMode,
+            status: sessionStatus
+        )
     }
 
     /// Replaces the transcript text for a session.
@@ -759,7 +886,12 @@ public actor HistoryStore {
         return formatter.date(from: combined) ?? Date()
     }
 
-    private func persistAudioArtifact(sessionID: UUID, sourcePath: URL) throws -> URL {
+    private struct PersistedAudioArtifact {
+        let url: URL
+        let deleteSourceAfterCommit: Bool
+    }
+
+    private func persistAudioArtifact(sessionID: UUID, sourcePath: URL) throws -> PersistedAudioArtifact {
         let extensionComponent = sourcePath.pathExtension.isEmpty ? "caf" : sourcePath.pathExtension
         let destinationDirectory = baseURL
             .appendingPathComponent("media", isDirectory: true)
@@ -767,19 +899,28 @@ public actor HistoryStore {
         let destination = destinationDirectory.appendingPathComponent("recording.\(extensionComponent)")
 
         if sourcePath.standardizedFileURL == destination.standardizedFileURL {
-            return destination
+            return PersistedAudioArtifact(url: destination, deleteSourceAfterCommit: false)
         }
 
         try fileManager.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
-        if fileManager.fileExists(atPath: destination.path) {
-            try fileManager.removeItem(at: destination)
+        let stagedDestination = destinationDirectory
+            .appendingPathComponent(".recording-\(UUID().uuidString)")
+            .appendingPathExtension(extensionComponent)
+        do {
+            try fileManager.copyItem(at: sourcePath, to: stagedDestination)
+            if fileManager.fileExists(atPath: destination.path) {
+                _ = try fileManager.replaceItemAt(destination, withItemAt: stagedDestination)
+            } else {
+                try fileManager.moveItem(at: stagedDestination, to: destination)
+            }
+        } catch {
+            try? fileManager.removeItem(at: stagedDestination)
+            throw error
         }
-        try fileManager.copyItem(at: sourcePath, to: destination)
-        if shouldDeleteTemporarySourceAfterCopy(sourcePath: sourcePath, destinationPath: destination) {
-            try? fileManager.removeItem(at: sourcePath)
-        }
-
-        return destination
+        return PersistedAudioArtifact(
+            url: destination,
+            deleteSourceAfterCommit: shouldDeleteTemporarySourceAfterCopy(sourcePath: sourcePath, destinationPath: destination)
+        )
     }
 
     private func shouldDeleteTemporarySourceAfterCopy(sourcePath: URL, destinationPath: URL) -> Bool {

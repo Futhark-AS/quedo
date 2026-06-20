@@ -109,6 +109,7 @@ final class HistoryStoreTests: XCTestCase {
         let sessions = try await store.listSessions(limit: 1)
         let transcript = try await store.transcriptText(sessionID: sessionID)
         let primaryAudio = try await store.primaryAudioFileURL(sessionID: sessionID)
+        let details = try await store.sessionDetails(sessionID: sessionID)
 
         XCTAssertEqual(promotedAudio, persistedAudio)
         XCTAssertEqual(sessions.first?.sessionID, sessionID)
@@ -116,6 +117,11 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertEqual(sessions.first?.transcriptPreview, "ferdig tekst")
         XCTAssertEqual(transcript, "ferdig tekst")
         XCTAssertEqual(primaryAudio, persistedAudio)
+        XCTAssertEqual(details?.providerPrimary, .elevenLabs)
+        XCTAssertEqual(details?.providerUsed, .elevenLabs)
+        XCTAssertEqual(details?.language, "no")
+        XCTAssertEqual(details?.outputMode, .clipboard)
+        XCTAssertEqual(details?.status, .success)
     }
 
     private func makeIsolatedHistoryStore() throws -> HistoryStore {
