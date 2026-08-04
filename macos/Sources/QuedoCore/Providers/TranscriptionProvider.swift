@@ -80,6 +80,36 @@ public extension ProviderError {
             return "invalid response from provider"
         }
     }
+
+    /// Stable error code for local diagnostics and incident grouping.
+    var diagnosticCode: String {
+        switch self {
+        case .timeout:
+            return "timeout"
+        case .networkFailure:
+            return "network_failure"
+        case .transient:
+            return "transient"
+        case .terminal:
+            return "terminal"
+        case .missingAPIKey:
+            return "missing_api_key"
+        case .invalidResponse:
+            return "invalid_response"
+        }
+    }
+
+    /// Non-sensitive structured fields for a provider error.
+    var diagnosticAttributes: [String: String] {
+        var attributes = ["error_code": diagnosticCode]
+        switch self {
+        case let .transient(statusCode), let .terminal(statusCode, _):
+            attributes["status_code"] = String(statusCode)
+        default:
+            break
+        }
+        return attributes
+    }
 }
 
 /// Transcription provider protocol.

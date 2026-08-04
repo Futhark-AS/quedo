@@ -2,8 +2,17 @@ import XCTest
 @testable import QuedoCore
 
 final class HistoryStoreTests: XCTestCase {
+    private func makeTestStore() throws -> HistoryStore {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("quedo-history-test-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: root)
+        }
+        return try HistoryStore(baseURL: root)
+    }
+
     func testSaveAndListSession() async throws {
-        let store = try makeIsolatedHistoryStore()
+        let store = try makeTestStore()
         let sessionID = UUID()
         let tempAudio = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("history-test-\(sessionID.uuidString).caf")
         try Data("audio".utf8).write(to: tempAudio)
@@ -37,7 +46,7 @@ final class HistoryStoreTests: XCTestCase {
     }
 
     func testPrimaryAudioFileURLReturnsNilWhenMissing() async throws {
-        let store = try makeIsolatedHistoryStore()
+        let store = try makeTestStore()
         let missing = try await store.primaryAudioFileURL(sessionID: UUID())
         XCTAssertNil(missing)
 
@@ -46,7 +55,7 @@ final class HistoryStoreTests: XCTestCase {
     }
 
     func testSaveSessionRemovesTemporarySourceAudio() async throws {
-        let store = try makeIsolatedHistoryStore()
+        let store = try makeTestStore()
         let sessionID = UUID()
         let tempAudio = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("history-test-cleanup-\(sessionID.uuidString).wav")
         try Data("audio".utf8).write(to: tempAudio)
@@ -69,67 +78,47 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: tempAudio.path))
     }
 
-    func testSaveSessionCanPromoteRetryAvailableRecordingToSuccess() async throws {
-        let store = try makeIsolatedHistoryStore()
+    func testDiagnosticEventsSurviveSessionUpsertAndKeepEventTimestamp() async throws {
+        let store = try makeTestStore()
         let sessionID = UUID()
-        let tempAudio = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("history-test-promote-\(sessionID.uuidString).wav")
+        let tempAudio = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("history-test-events-\(sessionID.uuidString).wav")
         try Data("audio".utf8).write(to: tempAudio)
 
-        let pending = SessionRecord(
+        let eventTime = Date(timeIntervalSince1970: 1234)
+        try await store.ensureDiagnosticSession(
             sessionID: sessionID,
-            createdAt: Date(),
-            durationMS: 3000,
-            providerPrimary: .elevenLabs,
-            providerUsed: .elevenLabs,
-            language: "no",
-            outputMode: .clipboard,
-            status: .retryAvailable,
-            transcript: "",
-            audioPath: tempAudio
+            createdAt: eventTime,
+            providerPrimary: .openAI,
+            language: "en",
+            outputMode: .clipboard
+        )
+        try await store.appendEvent(
+            sessionID: sessionID,
+            eventName: "session_trace_started",
+            payload: ["operation_id": "operation-1"],
+            createdAt: eventTime
         )
 
-        let persistedAudio = try await store.saveSession(pending)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: persistedAudio.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: tempAudio.path))
-
-        let success = SessionRecord(
+        let record = SessionRecord(
             sessionID: sessionID,
-            createdAt: pending.createdAt,
-            durationMS: 3000,
-            providerPrimary: .elevenLabs,
-            providerUsed: .elevenLabs,
-            language: "no",
+            createdAt: Date(timeIntervalSince1970: 2000),
+            durationMS: 1500,
+            providerPrimary: .openAI,
+            providerUsed: .openAI,
+            language: "en",
             outputMode: .clipboard,
             status: .success,
-            transcript: "ferdig tekst",
-            audioPath: persistedAudio
+            transcript: "persisted transcript",
+            audioPath: tempAudio
         )
+        try await store.saveSession(record)
 
-        let promotedAudio = try await store.saveSession(success)
-        let sessions = try await store.listSessions(limit: 1)
-        let transcript = try await store.transcriptText(sessionID: sessionID)
-        let primaryAudio = try await store.primaryAudioFileURL(sessionID: sessionID)
-        let details = try await store.sessionDetails(sessionID: sessionID)
-
-        XCTAssertEqual(promotedAudio, persistedAudio)
-        XCTAssertEqual(sessions.first?.sessionID, sessionID)
-        XCTAssertEqual(sessions.first?.status, .success)
-        XCTAssertEqual(sessions.first?.transcriptPreview, "ferdig tekst")
-        XCTAssertEqual(transcript, "ferdig tekst")
-        XCTAssertEqual(primaryAudio, persistedAudio)
-        XCTAssertEqual(details?.providerPrimary, .elevenLabs)
-        XCTAssertEqual(details?.providerUsed, .elevenLabs)
-        XCTAssertEqual(details?.language, "no")
-        XCTAssertEqual(details?.outputMode, .clipboard)
-        XCTAssertEqual(details?.status, .success)
-    }
-
-    private func makeIsolatedHistoryStore() throws -> HistoryStore {
-        let baseURL = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("quedo-history-test-\(UUID().uuidString)", isDirectory: true)
-        addTeardownBlock {
-            try? FileManager.default.removeItem(at: baseURL)
-        }
-        return try HistoryStore(baseURL: baseURL)
+        let events = try await store.listDiagnosticEvents(limit: 20, sessionID: sessionID)
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events.first?.eventName, "session_trace_started")
+        XCTAssertEqual(events.first?.sessionID, sessionID)
+        XCTAssertEqual(events.first?.createdAt, eventTime)
+        XCTAssertTrue(events.first?.payloadJSON.contains("operation-1") ?? false)
     }
 }

@@ -21,6 +21,8 @@ public final class HotkeyManager: @unchecked Sendable {
 
     private static let signature: OSType = 0x57415354 // WAST
     private static let logQueue = DispatchQueue(label: "com.futhark.quedo.hotkeys.log", qos: .utility)
+    private static let maxHotkeyLogBytes = 2_000_000
+    private static let maxHotkeyLogFiles = 5
 
     private var handlerRef: EventHandlerRef?
     private var hotkeyRefs: [UInt32: EventHotKeyRef] = [:]
@@ -599,6 +601,13 @@ public final class HotkeyManager: @unchecked Sendable {
                 if !FileManager.default.fileExists(atPath: url.path) {
                     _ = FileManager.default.createFile(atPath: url.path, contents: nil)
                 }
+                if
+                    let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                    let size = attributes[.size] as? NSNumber,
+                    size.intValue > Self.maxHotkeyLogBytes
+                {
+                    try Self.rotateHotkeyLog(at: url)
+                }
                 let handle = try FileHandle(forWritingTo: url)
                 defer { try? handle.close() }
                 try handle.seekToEnd()
@@ -609,5 +618,28 @@ public final class HotkeyManager: @unchecked Sendable {
                 // Avoid surfacing diagnostics write failures to runtime flow.
             }
         }
+    }
+
+    private static func rotateHotkeyLog(at active: URL) throws {
+        let fileManager = FileManager.default
+        for index in stride(from: maxHotkeyLogFiles - 1, through: 1, by: -1) {
+            let current = active.deletingLastPathComponent().appendingPathComponent("hotkeys.\(index).log")
+            let next = active.deletingLastPathComponent().appendingPathComponent("hotkeys.\(index + 1).log")
+            if fileManager.fileExists(atPath: next.path) {
+                try fileManager.removeItem(at: next)
+            }
+            if fileManager.fileExists(atPath: current.path) {
+                try fileManager.moveItem(at: current, to: next)
+            }
+        }
+
+        let first = active.deletingLastPathComponent().appendingPathComponent("hotkeys.1.log")
+        if fileManager.fileExists(atPath: first.path) {
+            try fileManager.removeItem(at: first)
+        }
+        if fileManager.fileExists(atPath: active.path) {
+            try fileManager.moveItem(at: active, to: first)
+        }
+        _ = fileManager.createFile(atPath: active.path, contents: nil)
     }
 }

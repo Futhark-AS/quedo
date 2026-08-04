@@ -20,6 +20,20 @@ public enum OutputRouterError: Error, Sendable {
     case syntheticPasteFailed
 }
 
+public extension OutputRouterError {
+    /// Stable output failure code for diagnostics.
+    var diagnosticCode: String {
+        switch self {
+        case .pasteUnavailableInProfile:
+            return "paste_unavailable_in_profile"
+        case .accessibilityPermissionRequired:
+            return "accessibility_permission_required"
+        case .syntheticPasteFailed:
+            return "synthetic_paste_failed"
+        }
+    }
+}
+
 /// Routes transcript text to configured output destinations.
 public actor OutputRouter {
     /// Creates output router.

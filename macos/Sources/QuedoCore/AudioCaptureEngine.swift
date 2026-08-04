@@ -20,6 +20,61 @@ public enum AudioCaptureError: Error, Sendable {
     case writerFailed
 }
 
+public extension AudioCaptureError {
+    /// Stable code used in diagnostics instead of relying on localized text.
+    var diagnosticCode: String {
+        switch self {
+        case .alreadyRecording:
+            return "already_recording"
+        case .notRecording:
+            return "not_recording"
+        case .streamOpenFailed:
+            return "stream_open_failed"
+        case .noInputDevice:
+            return "no_input_device"
+        case .callbackStalled:
+            return "callback_stalled"
+        case .stopTimedOut:
+            return "stop_timed_out"
+        case .writerFailed:
+            return "writer_failed"
+        }
+    }
+}
+
+/// Read-only health snapshot used by the application watchdog.
+public struct AudioCaptureHealthSnapshot: Sendable {
+    /// Session currently owned by the audio engine.
+    public let sessionID: UUID?
+    /// Start time of the active capture.
+    public let startedAt: Date?
+    /// Most recent callback frame time.
+    public let lastFrameAt: Date?
+    /// Stable pending error code, when the engine has detected a failure.
+    public let pendingErrorCode: String?
+    /// Whether the AVAudioEngine is currently running.
+    public let engineRunning: Bool
+    /// Whether an audio file writer is installed.
+    public let writerReady: Bool
+
+    /// Creates a health snapshot.
+    public init(
+        sessionID: UUID?,
+        startedAt: Date?,
+        lastFrameAt: Date?,
+        pendingErrorCode: String?,
+        engineRunning: Bool,
+        writerReady: Bool
+    ) {
+        self.sessionID = sessionID
+        self.startedAt = startedAt
+        self.lastFrameAt = lastFrameAt
+        self.pendingErrorCode = pendingErrorCode
+        self.engineRunning = engineRunning
+        self.writerReady = writerReady
+    }
+}
+
 /// Completed recording output.
 public struct AudioCaptureResult: Sendable {
     /// Session identifier.
@@ -34,6 +89,33 @@ public struct AudioCaptureResult: Sendable {
         self.sessionID = sessionID
         self.fileURL = fileURL
         self.durationMS = durationMS
+    }
+}
+
+/// Performs a potentially blocking AVAudioEngine stop away from the actor.
+///
+/// The engine instance is intentionally captured by this operation. If the
+/// stop exceeds its budget, the owning actor can replace its engine safely
+/// while this operation finishes against the old instance.
+private final class AudioEngineStopOperation: @unchecked Sendable {
+    private let engine: AVAudioEngine
+    private let group = DispatchGroup()
+
+    init(engine: AVAudioEngine) {
+        self.engine = engine
+    }
+
+    func start() {
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            defer { group.leave() }
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
+    }
+
+    func wait(timeoutSeconds: TimeInterval) -> Bool {
+        group.wait(timeout: .now() + timeoutSeconds) == .success
     }
 }
 
@@ -62,6 +144,18 @@ public actor AudioCaptureEngine {
     /// Prepares the audio engine to reduce first-start latency.
     public func prepareEngine() {
         prepareEngineIfPossible()
+    }
+
+    /// Returns the latest audio-capture health without changing engine state.
+    public func healthSnapshot() -> AudioCaptureHealthSnapshot {
+        AudioCaptureHealthSnapshot(
+            sessionID: sessionID,
+            startedAt: startedAt,
+            lastFrameAt: lastFrameAt,
+            pendingErrorCode: pendingError?.diagnosticCode,
+            engineRunning: engine.isRunning,
+            writerReady: writer != nil
+        )
     }
 
     /// Starts a recording session with retry and watchdog policies.
@@ -123,9 +217,15 @@ public actor AudioCaptureEngine {
             throw AudioCaptureError.notRecording
         }
 
-        let stopSucceeded = await stopWithWatchdog(timeout: .seconds(2))
+        let stopSucceeded = await stopWithWatchdog(timeoutSeconds: 2)
         if !stopSucceeded {
-            teardownEngine(force: true)
+            replaceEngineAfterStopTimeout()
+            endWatchdogs()
+            writer = nil
+            self.sessionID = nil
+            self.startedAt = nil
+            self.lastFrameAt = nil
+            pendingError = nil
             throw AudioCaptureError.stopTimedOut
         }
 
@@ -133,6 +233,10 @@ public actor AudioCaptureEngine {
 
         if let pendingError {
             self.pendingError = nil
+            self.sessionID = nil
+            self.startedAt = nil
+            self.lastFrameAt = nil
+            writer = nil
             throw pendingError
         }
 
@@ -140,6 +244,7 @@ public actor AudioCaptureEngine {
         self.sessionID = nil
 
         let durationMS = Int(Date().timeIntervalSince(startedAt) * 1000)
+        self.startedAt = nil
         let path = workingDirectory.appendingPathComponent(activeSessionID.uuidString).appendingPathExtension("wav")
         return AudioCaptureResult(sessionID: activeSessionID, fileURL: path, durationMS: max(durationMS, 0))
     }
@@ -149,6 +254,8 @@ public actor AudioCaptureEngine {
         teardownEngine(force: true)
         endWatchdogs()
         sessionID = nil
+        startedAt = nil
+        lastFrameAt = nil
         writer = nil
         pendingError = nil
     }
@@ -217,14 +324,12 @@ public actor AudioCaptureEngine {
         self.pendingError = nil
     }
 
-    private func stopWithWatchdog(timeout: Duration) async -> Bool {
-        _ = timeout
-        let start = Date()
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-
-        let elapsedSeconds = Date().timeIntervalSince(start)
-        return elapsedSeconds <= 2.0
+    private func stopWithWatchdog(timeoutSeconds: TimeInterval) async -> Bool {
+        let operation = AudioEngineStopOperation(engine: engine)
+        operation.start()
+        return await Task.detached(priority: .userInitiated) {
+            operation.wait(timeoutSeconds: timeoutSeconds)
+        }.value
     }
 
     private func startWatchdogs() {
@@ -304,6 +409,10 @@ public actor AudioCaptureEngine {
         } else {
             engine.stop()
         }
+    }
+
+    private func replaceEngineAfterStopTimeout() {
+        engine = AVAudioEngine()
     }
 
     private func installEnvironmentObservers() {

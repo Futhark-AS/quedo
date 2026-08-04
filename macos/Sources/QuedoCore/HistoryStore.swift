@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import SQLite3
 
@@ -88,6 +89,39 @@ public struct HistorySessionDetails: Sendable {
     }
 }
 
+/// Compact diagnostic event row suitable for incident reports.
+public struct DiagnosticEventSummary: Codable, Sendable {
+    /// Database event identifier.
+    public let id: String
+    /// Optional correlated session identifier.
+    public let sessionID: UUID?
+    /// Stable event name.
+    public let eventName: String
+    /// JSON-encoded event attributes.
+    public let payloadJSON: String
+    /// Event creation time.
+    public let createdAt: Date
+    /// Per-session sequence number.
+    public let eventSequence: Int64
+
+    /// Creates a diagnostic event row.
+    public init(
+        id: String,
+        sessionID: UUID?,
+        eventName: String,
+        payloadJSON: String,
+        createdAt: Date,
+        eventSequence: Int64
+    ) {
+        self.id = id
+        self.sessionID = sessionID
+        self.eventName = eventName
+        self.payloadJSON = payloadJSON
+        self.createdAt = createdAt
+        self.eventSequence = eventSequence
+    }
+}
+
 /// Migration summary for legacy Python imports.
 public struct LegacyMigrationReport: Sendable {
     /// Number of legacy folders scanned.
@@ -107,6 +141,8 @@ public struct LegacyMigrationReport: Sendable {
 
 /// SQLite-backed session history and migration store.
 public actor HistoryStore {
+    private static let databaseInitializationLock = NSLock()
+
     private let fileManager: FileManager
     private let baseURL: URL
     private let dbURL: URL
@@ -124,7 +160,11 @@ public actor HistoryStore {
         self.dbURL = resolvedDBURL
 
         try Self.setupDirectories(fileManager: fileManager, baseURL: resolvedBaseURL)
-        let openResult = try Self.openOrRecoverDatabase(at: resolvedDBURL, fileManager: fileManager)
+        Self.databaseInitializationLock.lock()
+        defer { Self.databaseInitializationLock.unlock() }
+        let openResult = try Self.withCrossProcessInitializationLock(at: resolvedDBURL) {
+            try Self.openOrRecoverDatabase(at: resolvedDBURL, fileManager: fileManager)
+        }
         let connection = openResult.connection
         self.recoveredDatabaseFromCorruption = openResult.recoveredFromCorruption
         self.db = connection
@@ -133,6 +173,80 @@ public actor HistoryStore {
     /// Indicates startup recovered from a corrupted on-disk database.
     public func recoveredDatabaseOnStartup() -> Bool {
         recoveredDatabaseFromCorruption
+    }
+
+    /// Creates the session row before the first correlated diagnostic event.
+    ///
+    /// Diagnostic events use a foreign key to retain referential integrity.
+    /// Recording begins before the final transcript is available, so a small
+    /// in-progress row must exist before those events are written.
+    public func ensureDiagnosticSession(
+        sessionID: UUID,
+        createdAt: Date = Date(),
+        providerPrimary: ProviderKind = .groq,
+        language: String = "auto",
+        outputMode: OutputMode = .none
+    ) throws {
+        let statement = try prepare(
+            """
+            INSERT INTO sessions (
+                session_id,
+                created_at,
+                duration_ms,
+                provider_primary,
+                provider_used,
+                language,
+                output_mode,
+                status,
+                legacy_source_path,
+                legacy_audio_format
+            ) VALUES (?, ?, 0, ?, ?, ?, ?, ?, NULL, NULL)
+            ON CONFLICT(session_id) DO NOTHING;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+
+        bindText(sessionID.uuidString, to: 1, in: statement)
+        bindDouble(createdAt.timeIntervalSince1970, to: 2, in: statement)
+        bindText(providerPrimary.rawValue, to: 3, in: statement)
+        bindText(providerPrimary.rawValue, to: 4, in: statement)
+        bindText(language, to: 5, in: statement)
+        bindText(outputMode.rawValue, to: 6, in: statement)
+        bindText(SessionStatus.processing.rawValue, to: 7, in: statement)
+        try stepDone(statement)
+    }
+
+    /// Updates a previously-created session marker without replacing its row.
+    public func updateSessionStatus(sessionID: UUID, status: SessionStatus) throws {
+        let statement = try prepare(
+            """
+            UPDATE sessions
+            SET status = ?
+            WHERE session_id = ?;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+
+        bindText(status.rawValue, to: 1, in: statement)
+        bindText(sessionID.uuidString, to: 2, in: statement)
+        try stepDone(statement)
+    }
+
+    /// Marks only an unfinished diagnostic marker as interrupted.
+    public func markProcessingSessionInterrupted(sessionID: UUID) throws {
+        let statement = try prepare(
+            """
+            UPDATE sessions
+            SET status = ?
+            WHERE session_id = ? AND status = ?;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+
+        bindText(SessionStatus.failed.rawValue, to: 1, in: statement)
+        bindText(sessionID.uuidString, to: 2, in: statement)
+        bindText(SessionStatus.processing.rawValue, to: 3, in: statement)
+        try stepDone(statement)
     }
 
     /// Stores a completed session and related artifacts.
@@ -230,7 +344,7 @@ public actor HistoryStore {
             )
             defer { sqlite3_finalize(mediaStatement) }
 
-            bindText(UUID().uuidString, to: 1, in: mediaStatement)
+            bindText("audio-\(session.sessionID.uuidString)", to: 1, in: mediaStatement)
             bindText(session.sessionID.uuidString, to: 2, in: mediaStatement)
             bindText("audio", to: 3, in: mediaStatement)
             bindText(persistedAudio.url.path, to: 4, in: mediaStatement)
@@ -249,13 +363,19 @@ public actor HistoryStore {
             )
             defer { sqlite3_finalize(transcriptStatement) }
 
-            bindText(UUID().uuidString, to: 1, in: transcriptStatement)
+            bindText("transcript-\(session.sessionID.uuidString)", to: 1, in: transcriptStatement)
             bindText(session.sessionID.uuidString, to: 2, in: transcriptStatement)
             bindText(session.transcript, to: 3, in: transcriptStatement)
             bindDouble(Date().timeIntervalSince1970, to: 4, in: transcriptStatement)
             try stepDone(transcriptStatement)
 
             try execute("COMMIT")
+            if shouldDeleteTemporarySourceAfterCopy(
+                sourcePath: session.audioPath,
+                destinationPath: persistedAudio.url
+            ) {
+                try? fileManager.removeItem(at: session.audioPath)
+            }
         } catch {
             try? execute("ROLLBACK")
             throw error
@@ -269,7 +389,12 @@ public actor HistoryStore {
     }
 
     /// Appends a structured session event entry.
-    public func appendEvent(sessionID: UUID?, eventName: String, payload: [String: String]) throws {
+    public func appendEvent(
+        sessionID: UUID?,
+        eventName: String,
+        payload: [String: String],
+        createdAt: Date = Date()
+    ) throws {
         let statement = try prepare(
             """
             INSERT INTO session_events (
@@ -291,9 +416,58 @@ public actor HistoryStore {
         bindOptionalText(sessionID?.uuidString, to: 2, in: statement)
         bindText(eventName, to: 3, in: statement)
         bindText(jsonString, to: 4, in: statement)
-        bindDouble(Date().timeIntervalSince1970, to: 5, in: statement)
+        bindDouble(createdAt.timeIntervalSince1970, to: 5, in: statement)
         bindInt64(nextEventSequence(sessionID: sessionID), to: 6, in: statement)
         try stepDone(statement)
+    }
+
+    /// Returns recent structured diagnostic events, newest first.
+    public func listDiagnosticEvents(limit: Int = 100, sessionID: UUID? = nil) throws -> [DiagnosticEventSummary] {
+        let statement = try prepare(
+            """
+            SELECT id, session_id, event_name, payload_json, created_at, event_seq
+            FROM session_events
+            WHERE (? IS NULL OR session_id = ?)
+            ORDER BY created_at DESC, event_seq DESC
+            LIMIT ?;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+
+        bindOptionalText(sessionID?.uuidString, to: 1, in: statement)
+        bindOptionalText(sessionID?.uuidString, to: 2, in: statement)
+        bindInt32(Int32(min(max(limit, 1), 1_000)), to: 3, in: statement)
+
+        var result: [DiagnosticEventSummary] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard
+                let idCString = sqlite3_column_text(statement, 0),
+                let eventCString = sqlite3_column_text(statement, 2),
+                let payloadCString = sqlite3_column_text(statement, 3)
+            else {
+                continue
+            }
+
+            let sessionID: UUID?
+            if let sessionCString = sqlite3_column_text(statement, 1) {
+                sessionID = UUID(uuidString: String(cString: sessionCString))
+            } else {
+                sessionID = nil
+            }
+
+            result.append(
+                DiagnosticEventSummary(
+                    id: String(cString: idCString),
+                    sessionID: sessionID,
+                    eventName: String(cString: eventCString),
+                    payloadJSON: String(cString: payloadCString),
+                    createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4)),
+                    eventSequence: sqlite3_column_int64(statement, 5)
+                )
+            )
+        }
+
+        return result
     }
 
     /// Returns latest session rows.
@@ -602,10 +776,42 @@ public actor HistoryStore {
             let connection = try openInitializedDatabase(at: dbURL)
             return (connection, false)
         } catch {
+            guard isRecoverableDatabaseError(error) else {
+                throw error
+            }
             try quarantineDatabaseFiles(at: dbURL, fileManager: fileManager)
             let connection = try openInitializedDatabase(at: dbURL)
             return (connection, true)
         }
+    }
+
+    private static func isRecoverableDatabaseError(_ error: Error) -> Bool {
+        guard case let HistoryStoreError.sqlError(message) = error else {
+            return false
+        }
+
+        let normalized = message.lowercased()
+        return normalized.contains("malformed")
+            || normalized.contains("not a database")
+            || normalized.contains("file is encrypted")
+    }
+
+    private static func withCrossProcessInitializationLock<T>(
+        at dbURL: URL,
+        _ body: () throws -> T
+    ) throws -> T {
+        let lockURL = dbURL.appendingPathExtension("init-lock")
+        let descriptor = open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else {
+            throw HistoryStoreError.databaseOpenFailed
+        }
+        defer { close(descriptor) }
+
+        guard flock(descriptor, LOCK_EX) == 0 else {
+            throw HistoryStoreError.databaseOpenFailed
+        }
+        defer { _ = flock(descriptor, LOCK_UN) }
+        return try body()
     }
 
     private static func openInitializedDatabase(at dbURL: URL) throws -> OpaquePointer {
@@ -636,6 +842,7 @@ public actor HistoryStore {
             try executeSQL("PRAGMA journal_mode=WAL;", on: connection)
             try executeSQL("PRAGMA synchronous=NORMAL;", on: connection)
             try executeSQL("PRAGMA foreign_keys=ON;", on: connection)
+            try executeSQL("PRAGMA busy_timeout=5000;", on: connection)
             return connection
         } catch {
             sqlite3_close(connection)
@@ -737,6 +944,19 @@ public actor HistoryStore {
                 metric_name TEXT NOT NULL,
                 metric_value REAL NOT NULL
             );
+
+            """,
+            on: db
+        )
+
+        // Index creation is an optimization and must not make startup fail
+        // when another Quedo process is briefly writing the WAL.
+        try? executeSQL(
+            """
+            CREATE INDEX IF NOT EXISTS idx_session_events_created_at
+                ON session_events(created_at DESC, event_seq DESC);
+            CREATE INDEX IF NOT EXISTS idx_session_events_session_created_at
+                ON session_events(session_id, created_at DESC, event_seq DESC);
             """,
             on: db
         )

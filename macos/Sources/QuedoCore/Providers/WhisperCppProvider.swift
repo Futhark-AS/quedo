@@ -202,8 +202,29 @@ public struct WhisperCppProvider: TranscriptionProvider {
 
         do {
             try process.run()
-            process.waitUntilExit()
+            let deadline = Date().addingTimeInterval(TimeInterval(max(1, timeoutSeconds)))
+            while process.isRunning {
+                try Task.checkCancellation()
+                if Date() >= deadline {
+                    process.terminate()
+                    throw ProviderError.timeout
+                }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+        } catch is CancellationError {
+            if process.isRunning {
+                process.terminate()
+            }
+            throw CancellationError()
+        } catch let providerError as ProviderError {
+            if process.isRunning {
+                process.terminate()
+            }
+            throw providerError
         } catch {
+            if process.isRunning {
+                process.terminate()
+            }
             throw ProviderError.networkFailure
         }
 
