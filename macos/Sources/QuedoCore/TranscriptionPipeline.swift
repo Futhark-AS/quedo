@@ -1,6 +1,103 @@
 import AVFoundation
 import Foundation
 
+/// Coordinates an unstructured provider task with a bounded timeout.
+///
+/// A structured task group must wait for a child that ignores cancellation.
+/// Providers are external implementations, so this small coordinator lets the
+/// pipeline return on timeout while still cancelling cooperative providers.
+private final class TranscriptionTimeoutCoordinator<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var finished = false
+    private var pendingResult: Result<Value, Error>?
+    private var continuation: AsyncThrowingStream<Value, Error>.Continuation?
+    private var providerTask: Task<Void, Never>?
+    private var timeoutTask: Task<Void, Never>?
+
+    func install(_ continuation: AsyncThrowingStream<Value, Error>.Continuation) {
+        let result: Result<Value, Error>?
+        lock.lock()
+        if finished {
+            result = pendingResult ?? .failure(CancellationError())
+        } else {
+            self.continuation = continuation
+            result = nil
+        }
+        lock.unlock()
+
+        if let result {
+            deliver(result, to: continuation)
+        }
+    }
+
+    func setProviderTask(_ task: Task<Void, Never>) {
+        lock.lock()
+        let shouldCancel = finished
+        if !shouldCancel {
+            providerTask = task
+        }
+        lock.unlock()
+        if shouldCancel {
+            task.cancel()
+        }
+    }
+
+    func setTimeoutTask(_ task: Task<Void, Never>) {
+        lock.lock()
+        let shouldCancel = finished
+        if !shouldCancel {
+            timeoutTask = task
+        }
+        lock.unlock()
+        if shouldCancel {
+            task.cancel()
+        }
+    }
+
+    @discardableResult
+    func finish(_ result: Result<Value, Error>) -> Bool {
+        let continuation: AsyncThrowingStream<Value, Error>.Continuation?
+        let providerTask: Task<Void, Never>?
+        let timeoutTask: Task<Void, Never>?
+
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return false
+        }
+        finished = true
+        pendingResult = result
+        continuation = self.continuation
+        providerTask = self.providerTask
+        timeoutTask = self.timeoutTask
+        lock.unlock()
+
+        providerTask?.cancel()
+        timeoutTask?.cancel()
+        if let continuation {
+            deliver(result, to: continuation)
+        }
+        return true
+    }
+
+    func cancel() {
+        _ = finish(.failure(CancellationError()))
+    }
+
+    private func deliver(
+        _ result: Result<Value, Error>,
+        to continuation: AsyncThrowingStream<Value, Error>.Continuation
+    ) {
+        switch result {
+        case let .success(value):
+            continuation.yield(value)
+            continuation.finish()
+        case let .failure(error):
+            continuation.finish(throwing: error)
+        }
+    }
+}
+
 /// Errors returned by the transcription pipeline.
 public enum TranscriptionPipelineError: Error, Sendable {
     /// No provider instance for requested kind.
@@ -26,6 +123,18 @@ public extension TranscriptionPipelineError {
             return "\(primary.rawValue) failed (\(primaryErrorDescription)); \(fallback.rawValue) failed (\(fallbackErrorDescription))"
         case .chunkingFailed:
             return "audio chunking/conversion failed"
+        }
+    }
+
+    /// Stable error code for pipeline incident grouping.
+    var diagnosticCode: String {
+        switch self {
+        case .providerUnavailable:
+            return "provider_unavailable"
+        case .retryAvailable:
+            return "retry_available"
+        case .chunkingFailed:
+            return "chunking_failed"
         }
     }
 }
@@ -64,6 +173,7 @@ public struct TranscriptionModelOverrides: Sendable {
 /// Orchestrates provider selection, retries, fallback, chunking, and cleanup.
 public actor TranscriptionPipeline {
     private let providers: [ProviderKind: any TranscriptionProvider]
+    private let diagnostics: DiagnosticsCenter?
     private var fallbackStickyUntil: Date?
     private var primaryProbeTask: Task<Void, Never>?
     private let fileManager = FileManager.default
@@ -72,13 +182,18 @@ public actor TranscriptionPipeline {
     private let chunkDurationSeconds: Double = 5 * 60
 
     /// Creates a transcription pipeline with registered providers.
-    public init(providers: [any TranscriptionProvider], requestTimeoutSeconds: Int = 12) {
+    public init(
+        providers: [any TranscriptionProvider],
+        requestTimeoutSeconds: Int = 12,
+        diagnostics: DiagnosticsCenter? = nil
+    ) {
         var table: [ProviderKind: any TranscriptionProvider] = [:]
         for provider in providers {
             table[provider.kind] = provider
         }
         self.providers = table
         self.requestTimeoutSeconds = requestTimeoutSeconds
+        self.diagnostics = diagnostics
     }
 
     /// Performs transcription with primary retry and fallback policy.
@@ -86,7 +201,71 @@ public actor TranscriptionPipeline {
         audioFileURL: URL,
         settings: AppSettings,
         modelOverrides: TranscriptionModelOverrides = TranscriptionModelOverrides(),
-        replacements: [String: String] = [:]
+        replacements: [String: String] = [:],
+        sessionID: UUID? = nil,
+        operationID: UUID? = nil
+    ) async throws -> TranscriptionPipelineResult {
+        let startedAt = Date()
+        await emit(
+            DiagnosticEvent(
+                name: "pipeline_started",
+                sessionID: sessionID,
+                attributes: [
+                    "primary": settings.provider.primary.rawValue,
+                    "fallback": settings.provider.fallback.rawValue,
+                    "timeout_seconds": String(requestTimeoutSeconds),
+                    "audio_path_extension": audioFileURL.pathExtension.lowercased()
+                ],
+                operationID: operationID
+            )
+        )
+
+        do {
+            let result = try await transcribeInternal(
+                audioFileURL: audioFileURL,
+                settings: settings,
+                modelOverrides: modelOverrides,
+                replacements: replacements,
+                sessionID: sessionID,
+                operationID: operationID
+            )
+            await emit(
+                DiagnosticEvent(
+                    name: "pipeline_completed",
+                    sessionID: sessionID,
+                    attributes: [
+                        "provider_used": result.providerUsed.rawValue,
+                        "fallback_used": result.fallbackUsed ? "true" : "false",
+                        "elapsed_ms": String(Int(Date().timeIntervalSince(startedAt) * 1000)),
+                        "transcript_characters": String(result.text.count)
+                    ],
+                    operationID: operationID
+                )
+            )
+            return result
+        } catch {
+            await emit(
+                DiagnosticEvent(
+                    name: "pipeline_failed",
+                    sessionID: sessionID,
+                    attributes: diagnosticAttributes(for: error).merging([
+                        "elapsed_ms": String(Int(Date().timeIntervalSince(startedAt) * 1000))
+                    ]) { current, _ in current },
+                    operationID: operationID,
+                    level: .error
+                )
+            )
+            throw error
+        }
+    }
+
+    private func transcribeInternal(
+        audioFileURL: URL,
+        settings: AppSettings,
+        modelOverrides: TranscriptionModelOverrides,
+        replacements: [String: String],
+        sessionID: UUID?,
+        operationID: UUID?
     ) async throws -> TranscriptionPipelineResult {
         let now = Date()
         let fallbackIsSticky = fallbackStickyUntil.map { now < $0 } ?? false
@@ -95,81 +274,82 @@ public actor TranscriptionPipeline {
         let preferredFallback = fallbackIsSticky ? settings.provider.primary : settings.provider.fallback
 
         let preparedChunks = try prepareSourceChunks(audioFileURL)
+        await emit(
+            DiagnosticEvent(
+                name: "pipeline_source_prepared",
+                sessionID: sessionID,
+                attributes: [
+                    "chunk_count": String(preparedChunks.chunkFiles.count),
+                    "temporary_file_count": String(preparedChunks.temporaryFiles.count)
+                ],
+                operationID: operationID
+            )
+        )
         var temporaryFiles = preparedChunks.temporaryFiles
-        var flacUploadChunks: [URL]?
         defer {
             cleanupTemporaryFiles(temporaryFiles)
-        }
-
-        func chunksForProvider(_ provider: any TranscriptionProvider) throws -> [URL] {
-            guard provider.requiresFLACUpload else {
-                return preparedChunks.chunkFiles
-            }
-
-            if let flacUploadChunks {
-                return flacUploadChunks
-            }
-
-            var converted: [URL] = []
-            for chunk in preparedChunks.chunkFiles {
-                if chunk.pathExtension.lowercased() == "flac" {
-                    converted.append(chunk)
-                    continue
-                }
-
-                let transcoded = try transcodeToFLAC(chunk)
-                converted.append(transcoded)
-                temporaryFiles.append(transcoded)
-            }
-            flacUploadChunks = converted
-            return converted
         }
 
         let primary = try provider(for: preferredPrimary)
         let fallback = try provider(for: preferredFallback)
 
         do {
-            let primaryChunks = try chunksForProvider(primary)
+            let primaryPrepared = try await chunksForProvider(primary, sourceChunks: preparedChunks.chunkFiles)
+            temporaryFiles.append(contentsOf: primaryPrepared.temporaryFiles)
             let text = try await runChunks(
-                chunks: primaryChunks,
+                chunks: primaryPrepared.chunkFiles,
                 with: primary,
                 model: modelOverrides.primaryModel ?? model(for: preferredPrimary, settings: settings),
                 language: settings.language,
-                vocabularyHints: settings.vocabularyHints
+                vocabularyHints: settings.vocabularyHints,
+                attempt: "primary",
+                sessionID: sessionID,
+                operationID: operationID
             )
             let cleaned = cleanup(text: text, replacements: replacements)
             return TranscriptionPipelineResult(text: cleaned, providerUsed: preferredPrimary, fallbackUsed: false)
         } catch {
+            try Task.checkCancellation()
             let shouldRetryPrimary = isRetryable(error)
             if shouldRetryPrimary {
-                try? await Task.sleep(for: .seconds(1))
+                try await Task.sleep(for: .seconds(1))
                 do {
-                    let primaryChunks = try chunksForProvider(primary)
+                    let primaryPrepared = try await chunksForProvider(primary, sourceChunks: preparedChunks.chunkFiles)
+                    temporaryFiles.append(contentsOf: primaryPrepared.temporaryFiles)
                     let text = try await runChunks(
-                        chunks: primaryChunks,
+                        chunks: primaryPrepared.chunkFiles,
                         with: primary,
                         model: modelOverrides.primaryModel ?? model(for: preferredPrimary, settings: settings),
                         language: settings.language,
-                        vocabularyHints: settings.vocabularyHints
+                        vocabularyHints: settings.vocabularyHints,
+                        attempt: "primary_retry",
+                        sessionID: sessionID,
+                        operationID: operationID
                     )
                     let cleaned = cleanup(text: text, replacements: replacements)
                     return TranscriptionPipelineResult(text: cleaned, providerUsed: preferredPrimary, fallbackUsed: false)
                 } catch {
+                    try Task.checkCancellation()
                     let primaryErrorDescription = describe(error)
                     do {
-                        let fallbackChunks = try chunksForProvider(fallback)
+                        let fallbackPrepared = try await chunksForProvider(fallback, sourceChunks: preparedChunks.chunkFiles)
+                        temporaryFiles.append(contentsOf: fallbackPrepared.temporaryFiles)
                         let text = try await runChunks(
-                            chunks: fallbackChunks,
+                            chunks: fallbackPrepared.chunkFiles,
                             with: fallback,
                             model: modelOverrides.fallbackModel ?? model(for: preferredFallback, settings: settings),
                             language: settings.language,
-                            vocabularyHints: settings.vocabularyHints
+                            vocabularyHints: settings.vocabularyHints,
+                            attempt: "fallback_after_primary_retry",
+                            sessionID: sessionID,
+                            operationID: operationID
                         )
                         fallbackStickyUntil = Date().addingTimeInterval(30)
                         startPrimaryReprobe(provider: primary)
                         let cleaned = cleanup(text: text, replacements: replacements)
                         return TranscriptionPipelineResult(text: cleaned, providerUsed: preferredFallback, fallbackUsed: true)
                     } catch {
+                        try Task.checkCancellation()
                         throw TranscriptionPipelineError.retryAvailable(
                             primary: preferredPrimary,
                             fallback: preferredFallback,
@@ -182,19 +362,24 @@ public actor TranscriptionPipeline {
 
             let primaryErrorDescription = describe(error)
             do {
-                let fallbackChunks = try chunksForProvider(fallback)
+                let fallbackPrepared = try await chunksForProvider(fallback, sourceChunks: preparedChunks.chunkFiles)
+                temporaryFiles.append(contentsOf: fallbackPrepared.temporaryFiles)
                 let text = try await runChunks(
-                    chunks: fallbackChunks,
+                    chunks: fallbackPrepared.chunkFiles,
                     with: fallback,
                     model: modelOverrides.fallbackModel ?? model(for: preferredFallback, settings: settings),
                     language: settings.language,
-                    vocabularyHints: settings.vocabularyHints
+                    vocabularyHints: settings.vocabularyHints,
+                    attempt: "fallback",
+                    sessionID: sessionID,
+                    operationID: operationID
                 )
                 fallbackStickyUntil = Date().addingTimeInterval(30)
                 startPrimaryReprobe(provider: primary)
                 let cleaned = cleanup(text: text, replacements: replacements)
                 return TranscriptionPipelineResult(text: cleaned, providerUsed: preferredFallback, fallbackUsed: true)
             } catch {
+                try Task.checkCancellation()
                 throw TranscriptionPipelineError.retryAvailable(
                     primary: preferredPrimary,
                     fallback: preferredFallback,
@@ -222,7 +407,32 @@ public actor TranscriptionPipeline {
 
         async let primaryResult = primaryProvider.checkHealth(timeoutSeconds: 6)
         async let fallbackResult = fallbackProvider.checkHealth(timeoutSeconds: 6)
-        return await (primaryResult, fallbackResult)
+        let result = await (primaryResult, fallbackResult)
+        await emit(
+            DiagnosticEvent(
+                name: "provider_health_check",
+                sessionID: nil,
+                attributes: [
+                    "provider": primary.rawValue,
+                    "role": "primary",
+                    "healthy": result.0 ? "true" : "false"
+                ],
+                level: result.0 ? .debug : .warning
+            )
+        )
+        await emit(
+            DiagnosticEvent(
+                name: "provider_health_check",
+                sessionID: nil,
+                attributes: [
+                    "provider": fallback.rawValue,
+                    "role": "fallback",
+                    "healthy": result.1 ? "true" : "false"
+                ],
+                level: result.1 ? .debug : .warning
+            )
+        )
+        return result
     }
 
     private func provider(for kind: ProviderKind) throws -> any TranscriptionProvider {
@@ -237,12 +447,41 @@ public actor TranscriptionPipeline {
         with provider: any TranscriptionProvider,
         model: String,
         language: String,
-        vocabularyHints: [String]
+        vocabularyHints: [String],
+        attempt: String,
+        sessionID: UUID?,
+        operationID: UUID?
     ) async throws -> String {
         var combined: [String] = []
         var rollingContext: String?
+        let attemptStartedAt = Date()
 
-        for chunk in chunks {
+        await markProgress(
+            sessionID: sessionID,
+            operationID: operationID,
+            phase: "processing",
+            stage: "provider_attempt_started",
+            details: [
+                "attempt": attempt,
+                "provider": provider.kind.rawValue
+            ]
+        )
+
+        await emit(
+            DiagnosticEvent(
+                name: "provider_attempt_started",
+                sessionID: sessionID,
+                attributes: [
+                    "attempt": attempt,
+                    "provider": provider.kind.rawValue,
+                    "model": diagnosticModelIdentifier(model),
+                    "chunk_count": String(chunks.count)
+                ],
+                operationID: operationID
+            )
+        )
+
+        for (index, chunk) in chunks.enumerated() {
             let request = TranscriptionRequest(
                 audioFileURL: chunk,
                 language: language,
@@ -250,44 +489,221 @@ public actor TranscriptionPipeline {
                 context: rollingContext,
                 vocabularyHints: vocabularyHints
             )
-            let response = try await transcribeChunkWithTimeout(request: request, provider: provider)
-            combined.append(response.text)
-            rollingContext = String(response.text.suffix(300))
+
+            let chunkStartedAt = Date()
+            await markProgress(
+                sessionID: sessionID,
+                operationID: operationID,
+                phase: "processing",
+                stage: "provider_chunk_started",
+                details: [
+                    "attempt": attempt,
+                    "provider": provider.kind.rawValue,
+                    "chunk_index": String(index),
+                    "chunk_count": String(chunks.count)
+                ]
+            )
+            await emit(
+                DiagnosticEvent(
+                    name: "provider_chunk_started",
+                    sessionID: sessionID,
+                    attributes: [
+                        "attempt": attempt,
+                        "provider": provider.kind.rawValue,
+                        "chunk_index": String(index),
+                        "chunk_count": String(chunks.count)
+                    ],
+                    operationID: operationID,
+                    level: .debug
+                )
+            )
+
+            do {
+                let response = try await transcribeChunkWithTimeout(
+                    request: request,
+                    provider: provider,
+                    sessionID: sessionID,
+                    operationID: operationID,
+                    attempt: attempt,
+                    chunkIndex: index,
+                    chunkCount: chunks.count
+                )
+                combined.append(response.text)
+                rollingContext = String(response.text.suffix(300))
+                await markProgress(
+                    sessionID: sessionID,
+                    operationID: operationID,
+                    phase: "processing",
+                    stage: "provider_chunk_completed",
+                    details: [
+                        "attempt": attempt,
+                        "provider": provider.kind.rawValue,
+                        "chunk_index": String(index),
+                        "chunk_count": String(chunks.count)
+                    ]
+                )
+                await emit(
+                    DiagnosticEvent(
+                        name: "provider_chunk_completed",
+                        sessionID: sessionID,
+                        attributes: [
+                            "attempt": attempt,
+                            "provider": provider.kind.rawValue,
+                            "chunk_index": String(index),
+                            "chunk_count": String(chunks.count),
+                            "elapsed_ms": String(Int(Date().timeIntervalSince(chunkStartedAt) * 1000)),
+                            "response_characters": String(response.text.count)
+                        ],
+                        operationID: operationID,
+                        level: .debug
+                    )
+                )
+            } catch {
+                await emit(
+                    DiagnosticEvent(
+                        name: "provider_chunk_failed",
+                        sessionID: sessionID,
+                        attributes: diagnosticAttributes(for: error).merging([
+                            "attempt": attempt,
+                            "provider": provider.kind.rawValue,
+                            "chunk_index": String(index),
+                            "chunk_count": String(chunks.count),
+                            "elapsed_ms": String(Int(Date().timeIntervalSince(chunkStartedAt) * 1000))
+                        ]) { current, _ in current },
+                        operationID: operationID,
+                        level: .error
+                    )
+                )
+                await emit(
+                    DiagnosticEvent(
+                        name: "provider_attempt_failed",
+                        sessionID: sessionID,
+                        attributes: diagnosticAttributes(for: error).merging([
+                            "attempt": attempt,
+                            "provider": provider.kind.rawValue,
+                            "chunk_index": String(index),
+                            "chunk_count": String(chunks.count),
+                            "elapsed_ms": String(Int(Date().timeIntervalSince(attemptStartedAt) * 1000))
+                        ]) { current, _ in current },
+                        operationID: operationID,
+                        level: .error
+                    )
+                )
+                throw error
+            }
         }
 
+        await emit(
+            DiagnosticEvent(
+                name: "provider_attempt_completed",
+                sessionID: sessionID,
+                attributes: [
+                    "attempt": attempt,
+                    "provider": provider.kind.rawValue,
+                    "chunk_count": String(chunks.count),
+                    "elapsed_ms": String(Int(Date().timeIntervalSince(attemptStartedAt) * 1000)),
+                    "response_characters": String(combined.joined(separator: " ").count)
+                ],
+                operationID: operationID
+            )
+        )
         return combined.joined(separator: " ")
     }
 
     /// Enforces a hard timeout around provider transcription to prevent indefinite hangs.
     private func transcribeChunkWithTimeout(
         request: TranscriptionRequest,
-        provider: any TranscriptionProvider
+        provider: any TranscriptionProvider,
+        sessionID: UUID?,
+        operationID: UUID?,
+        attempt: String,
+        chunkIndex: Int,
+        chunkCount: Int
     ) async throws -> TranscriptionResponse {
         let timeoutSeconds = requestTimeoutSeconds
+        let coordinator = TranscriptionTimeoutCoordinator<TranscriptionResponse>()
 
-        return try await withThrowingTaskGroup(of: TranscriptionResponse.self) { group in
-            group.addTask {
-                try await provider.transcribe(request: request)
-            }
-            group.addTask {
-                try await Task.sleep(for: .seconds(Double(timeoutSeconds)))
-                throw ProviderError.timeout
+        return try await withTaskCancellationHandler(operation: {
+            let stream = AsyncThrowingStream<TranscriptionResponse, Error> { continuation in
+                coordinator.install(continuation)
+
+                coordinator.setProviderTask(Task {
+                    do {
+                        let response = try await provider.transcribe(request: request)
+                        _ = coordinator.finish(.success(response))
+                    } catch {
+                        _ = coordinator.finish(.failure(error))
+                    }
+                })
+
+                coordinator.setTimeoutTask(Task {
+                    do {
+                        try await Task.sleep(for: .seconds(Double(timeoutSeconds)))
+                    } catch {
+                        return
+                    }
+                    guard !Task.isCancelled else {
+                        return
+                    }
+
+                    let timedOut = coordinator.finish(.failure(ProviderError.timeout))
+                    guard timedOut else {
+                        return
+                    }
+                    await self.emit(
+                        DiagnosticEvent(
+                            name: "provider_chunk_timeout",
+                            sessionID: sessionID,
+                            attributes: [
+                                "attempt": attempt,
+                                "provider": provider.kind.rawValue,
+                                "chunk_index": String(chunkIndex),
+                                "chunk_count": String(chunkCount),
+                                "timeout_seconds": String(timeoutSeconds)
+                            ],
+                            operationID: operationID,
+                            level: .error
+                        )
+                    )
+                })
             }
 
-            defer {
-                group.cancelAll()
-            }
-
-            guard let response = try await group.next() else {
+            var iterator = stream.makeAsyncIterator()
+            guard let response = try await iterator.next() else {
                 throw ProviderError.networkFailure
             }
             return response
-        }
+        }, onCancel: {
+            coordinator.cancel()
+        })
     }
 
     private struct PreparedSourceChunks: Sendable {
         let chunkFiles: [URL]
         let temporaryFiles: [URL]
+    }
+
+    private func chunksForProvider(
+        _ provider: any TranscriptionProvider,
+        sourceChunks: [URL]
+    ) async throws -> PreparedSourceChunks {
+        guard provider.requiresFLACUpload else {
+            return PreparedSourceChunks(chunkFiles: sourceChunks, temporaryFiles: [])
+        }
+
+        var converted: [URL] = []
+        var temporaryFiles: [URL] = []
+        for chunk in sourceChunks {
+            if chunk.pathExtension.lowercased() == "flac" {
+                converted.append(chunk)
+                continue
+            }
+
+            let transcoded = try await transcodeToFLAC(chunk)
+            converted.append(transcoded)
+            temporaryFiles.append(transcoded)
+        }
+        return PreparedSourceChunks(chunkFiles: converted, temporaryFiles: temporaryFiles)
     }
 
     private struct WAVMetadata {
@@ -304,7 +720,7 @@ public actor TranscriptionPipeline {
         return PreparedSourceChunks(chunkFiles: chunkFiles, temporaryFiles: temporaryFiles)
     }
 
-    private func transcodeToFLAC(_ sourceURL: URL) throws -> URL {
+    private func transcodeToFLAC(_ sourceURL: URL) async throws -> URL {
         let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("QuedoUploadAudio", isDirectory: true)
         do {
             try fileManager.createDirectory(at: tempRoot, withIntermediateDirectories: true)
@@ -318,19 +734,49 @@ public actor TranscriptionPipeline {
         process.arguments = [sourceURL.path, "-f", "flac", "-d", "flac", destinationURL.path]
         process.standardOutput = Pipe()
         process.standardError = Pipe()
+        var conversionSucceeded = false
+        defer {
+            if process.isRunning {
+                process.terminate()
+            }
+            if !conversionSucceeded {
+                try? fileManager.removeItem(at: destinationURL)
+            }
+        }
 
         do {
             try process.run()
-            process.waitUntilExit()
+            let deadline = Date().addingTimeInterval(TimeInterval(max(1, requestTimeoutSeconds)))
+            while process.isRunning {
+                try Task.checkCancellation()
+                if Date() >= deadline {
+                    process.terminate()
+                    throw TranscriptionPipelineError.chunkingFailed
+                }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+        } catch is CancellationError {
+            if process.isRunning {
+                process.terminate()
+            }
+            throw CancellationError()
+        } catch let pipelineError as TranscriptionPipelineError {
+            if process.isRunning {
+                process.terminate()
+            }
+            throw pipelineError
         } catch {
+            if process.isRunning {
+                process.terminate()
+            }
             throw TranscriptionPipelineError.chunkingFailed
         }
 
         guard process.terminationStatus == 0, fileManager.fileExists(atPath: destinationURL.path) else {
-            try? fileManager.removeItem(at: destinationURL)
             throw TranscriptionPipelineError.chunkingFailed
         }
 
+        conversionSucceeded = true
         return destinationURL
     }
 
@@ -745,6 +1191,59 @@ public actor TranscriptionPipeline {
 
     private func clearFallbackStickyWindow() {
         fallbackStickyUntil = nil
+    }
+
+    private func emit(_ event: DiagnosticEvent) async {
+        await diagnostics?.emit(event)
+    }
+
+    private func markProgress(
+        sessionID: UUID?,
+        operationID: UUID?,
+        phase: String,
+        stage: String,
+        details: [String: String]
+    ) async {
+        guard let sessionID else {
+            return
+        }
+        await diagnostics?.markSessionProgress(
+            sessionID: sessionID,
+            operationID: operationID,
+            phase: phase,
+            stage: stage,
+            details: details
+        )
+    }
+
+    private func diagnosticModelIdentifier(_ model: String) -> String {
+        let lastComponent = URL(fileURLWithPath: model).lastPathComponent
+        return lastComponent.isEmpty ? model : lastComponent
+    }
+
+    private func diagnosticAttributes(for error: Error) -> [String: String] {
+        if let providerError = error as? ProviderError {
+            return providerError.diagnosticAttributes
+        }
+
+        if let pipelineError = error as? TranscriptionPipelineError {
+            var attributes = ["error_code": pipelineError.diagnosticCode]
+            switch pipelineError {
+            case let .providerUnavailable(provider):
+                attributes["provider"] = provider.rawValue
+            case let .retryAvailable(primary, fallback, _, _):
+                attributes["primary"] = primary.rawValue
+                attributes["fallback"] = fallback.rawValue
+            case .chunkingFailed:
+                break
+            }
+            return attributes
+        }
+
+        return [
+            "error_code": "unknown",
+            "error_type": String(reflecting: type(of: error))
+        ]
     }
 }
 

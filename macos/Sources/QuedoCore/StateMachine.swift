@@ -137,7 +137,7 @@ public struct StateTransitionError: Error, Sendable {
     }
 }
 
-/// Event emitted for every accepted state transition.
+/// Event emitted for every attempted state transition.
 public struct LifecycleTransitionEvent: Sendable {
     /// Transition source.
     public let from: AppPhase
@@ -145,12 +145,28 @@ public struct LifecycleTransitionEvent: Sendable {
     public let to: AppPhase
     /// Transition timestamp.
     public let timestamp: Date
+    /// Session active when the transition was attempted.
+    public let sessionID: UUID?
+    /// Whether the transition was accepted.
+    public let accepted: Bool
+    /// Rejection or no-op reason, when present.
+    public let reason: String?
 
     /// Creates a transition event.
-    public init(from: AppPhase, to: AppPhase, timestamp: Date = Date()) {
+    public init(
+        from: AppPhase,
+        to: AppPhase,
+        timestamp: Date = Date(),
+        sessionID: UUID? = nil,
+        accepted: Bool = true,
+        reason: String? = nil
+    ) {
         self.from = from
         self.to = to
         self.timestamp = timestamp
+        self.sessionID = sessionID
+        self.accepted = accepted
+        self.reason = reason
     }
 }
 
@@ -217,7 +233,17 @@ public actor LifecycleStateMachine {
             return
         }
         guard isAllowedTransition(from: phase, to: next) else {
-            throw StateTransitionError(from: phase, to: next, reason: "Transition is not permitted")
+            let reason = "Transition is not permitted"
+            onTransition(
+                LifecycleTransitionEvent(
+                    from: phase,
+                    to: next,
+                    sessionID: currentSessionID,
+                    accepted: false,
+                    reason: reason
+                )
+            )
+            throw StateTransitionError(from: phase, to: next, reason: reason)
         }
 
         let from = phase
@@ -229,7 +255,14 @@ public actor LifecycleStateMachine {
             degradedReason = nil
         }
 
-        onTransition(LifecycleTransitionEvent(from: from, to: next))
+        onTransition(
+            LifecycleTransitionEvent(
+                from: from,
+                to: next,
+                sessionID: currentSessionID,
+                accepted: true
+            )
+        )
     }
 
     /// Returns UI contract for the current phase snapshot.

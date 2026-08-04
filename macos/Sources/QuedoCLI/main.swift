@@ -57,6 +57,7 @@ struct QuedoCLI: AsyncParsableCommand {
             Stop.self,
             Status.self,
             Logs.self,
+            Diagnostics.self,
             Doctor.self,
             Config.self,
             History.self,
@@ -161,6 +162,68 @@ struct Logs: AsyncParsableCommand {
 
         let content = try String(contentsOf: file, encoding: .utf8)
         print(content)
+    }
+}
+
+struct Diagnostics: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Incident and runtime diagnostics",
+        subcommands: [Report.self]
+    )
+
+    struct Report: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Print recent structured diagnostic events")
+
+        @Option(help: "Maximum number of events to print")
+        var limit: Int = 80
+
+        @Option(help: "Filter events to one session UUID")
+        var sessionID: String?
+
+        mutating func run() async throws {
+            let store = try HistoryStore()
+            let filteredSessionID: UUID?
+            if let sessionID {
+                guard let parsed = UUID(uuidString: sessionID) else {
+                    throw ValidationError("session-id must be a UUID")
+                }
+                filteredSessionID = parsed
+            } else {
+                filteredSessionID = nil
+            }
+
+            let events = try await store.listDiagnosticEvents(limit: limit, sessionID: filteredSessionID)
+            let root = await store.storageBasePath()
+            let runtimeURL = root.appendingPathComponent("runtime-state.json")
+
+            print("runtime_state=\(runtimeURL.path)")
+            if let data = try? Data(contentsOf: runtimeURL) {
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                if let snapshot = try? decoder.decode(RuntimeDiagnosticsSnapshot.self, from: data) {
+                    print("runtime.status=\(snapshot.status)")
+                    print("runtime.phase=\(snapshot.phase)")
+                    print("runtime.stage=\(snapshot.stage)")
+                    let runtimeSessionID = snapshot.sessionID?.uuidString ?? "none"
+                    let runtimeOperationID = snapshot.operationID?.uuidString ?? "none"
+                    let lastProgressAt = snapshot.lastProgressAt.map(String.init(describing:)) ?? "none"
+                    print("runtime.session_id=\(runtimeSessionID)")
+                    print("runtime.operation_id=\(runtimeOperationID)")
+                    print("runtime.updated_at=\(snapshot.updatedAt)")
+                    print("runtime.last_progress_at=\(lastProgressAt)")
+                } else {
+                    print("runtime.decode=failed")
+                }
+            } else {
+                print("runtime=not_found")
+            }
+
+            print("events.count=\(events.count)")
+            for event in events {
+                let session = event.sessionID?.uuidString ?? "none"
+                print("\(event.createdAt) \(event.eventName) session=\(session) payload=\(event.payloadJSON)")
+            }
+        }
     }
 }
 

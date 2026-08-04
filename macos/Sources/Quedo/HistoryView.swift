@@ -9,12 +9,14 @@ struct HistoryView: View {
     init(
         historyStore: HistoryStore,
         transcriptionPipeline: TranscriptionPipeline,
-        configurationManager: ConfigurationManager
+        configurationManager: ConfigurationManager,
+        diagnostics: DiagnosticsCenter
     ) {
         _model = StateObject(wrappedValue: HistoryViewModel(
             historyStore: historyStore,
             transcriptionPipeline: transcriptionPipeline,
-            configurationManager: configurationManager
+            configurationManager: configurationManager,
+            diagnostics: diagnostics
         ))
     }
 
@@ -133,6 +135,7 @@ final class HistoryViewModel: ObservableObject {
     private let historyStore: HistoryStore
     private let transcriptionPipeline: TranscriptionPipeline
     private let configurationManager: ConfigurationManager
+    private let diagnostics: DiagnosticsCenter
     private let pageSize = 100
     private var currentLimit = 100
     private var playbackSound: NSSound?
@@ -140,11 +143,13 @@ final class HistoryViewModel: ObservableObject {
     init(
         historyStore: HistoryStore,
         transcriptionPipeline: TranscriptionPipeline,
-        configurationManager: ConfigurationManager
+        configurationManager: ConfigurationManager,
+        diagnostics: DiagnosticsCenter
     ) {
         self.historyStore = historyStore
         self.transcriptionPipeline = transcriptionPipeline
         self.configurationManager = configurationManager
+        self.diagnostics = diagnostics
     }
 
     func retranscribeLanguageBinding(for sessionID: UUID) -> Binding<String> {
@@ -261,6 +266,8 @@ final class HistoryViewModel: ObservableObject {
     func retranscribe(sessionID: UUID) async {
         guard retranscribingSessionID == nil else { return }
 
+        var operationID: UUID?
+        var traceStarted = false
         do {
             guard let audioURL = try await historyStore.primaryAudioFileURL(sessionID: sessionID) else {
                 errorMessage = "No audio file found for this session"
@@ -287,9 +294,31 @@ final class HistoryViewModel: ObservableObject {
             settings.provider.primary = details.providerPrimary
             settings.language = language.isEmpty ? details.language : language
 
+            let newOperationID = UUID()
+            operationID = newOperationID
+            await diagnostics.beginSessionTrace(
+                sessionID: sessionID,
+                operationID: newOperationID,
+                phase: "processing",
+                stage: "history_retranscription_requested",
+                providerPrimary: settings.provider.primary,
+                language: settings.language,
+                outputMode: settings.outputMode
+            )
+            traceStarted = true
+            await diagnostics.markSessionProgress(
+                sessionID: sessionID,
+                operationID: newOperationID,
+                phase: "processing",
+                stage: "history_retranscription_started",
+                details: ["language": settings.language]
+            )
+
             let result = try await transcriptionPipeline.transcribe(
                 audioFileURL: audioURL,
-                settings: settings
+                settings: settings,
+                sessionID: sessionID,
+                operationID: newOperationID
             )
 
             let record = SessionRecord(
@@ -305,10 +334,47 @@ final class HistoryViewModel: ObservableObject {
                 audioPath: audioURL
             )
             try await historyStore.saveSession(record)
+            await diagnostics.emit(
+                DiagnosticEvent(
+                    name: "history_retranscription_persisted",
+                    sessionID: sessionID,
+                    attributes: ["provider": result.providerUsed.rawValue],
+                    operationID: newOperationID
+                )
+            )
+            await diagnostics.endSessionTrace(
+                sessionID: sessionID,
+                operationID: newOperationID,
+                outcome: "success",
+                phase: "ready",
+                stage: "history_retranscription_completed"
+            )
+            traceStarted = false
             statusMessage = "Re-transcription complete"
             retranscribingSessionID = nil
             await load(reset: true)
         } catch {
+            if traceStarted, let operationID {
+                await diagnostics.emit(
+                    DiagnosticEvent(
+                        name: "history_retranscription_failed",
+                        sessionID: sessionID,
+                        attributes: [
+                            "error_code": "retranscription_failed",
+                            "error_type": String(reflecting: type(of: error))
+                        ],
+                        operationID: operationID,
+                        level: .error
+                    )
+                )
+                await diagnostics.endSessionTrace(
+                    sessionID: sessionID,
+                    operationID: operationID,
+                    outcome: "failed",
+                    phase: "retryAvailable",
+                    stage: "history_retranscription_failed"
+                )
+            }
             errorMessage = "Re-transcription failed: \(error.localizedDescription)"
             statusMessage = nil
             retranscribingSessionID = nil

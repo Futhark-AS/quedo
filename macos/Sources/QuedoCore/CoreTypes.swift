@@ -632,6 +632,8 @@ public enum DegradedReason: String, Codable, Sendable {
 
 /// Session-level status used by history persistence.
 public enum SessionStatus: String, Codable, Sendable {
+    /// Session is currently being recorded or processed.
+    case processing
     /// Session completed successfully.
     case success
     /// Session failed and can be retried.

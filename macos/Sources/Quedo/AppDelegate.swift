@@ -85,7 +85,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func bootstrap(menuBar: MenuBarController) async {
         let configurationManager = ConfigurationManager()
         let permissionCoordinator = PermissionCoordinator()
-        let lifecycle = LifecycleStateMachine()
         let audioEngine = AudioCaptureEngine()
 
         let historyStore: HistoryStore
@@ -101,6 +100,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let fileLogger = RotatingFileLogger(directory: appSupport.appendingPathComponent("logs", isDirectory: true))
         let logger = AppLogger(subsystem: "com.futhark.quedo.app", category: "runtime", fileLogger: fileLogger)
         let diagnostics = DiagnosticsCenter(historyStore: historyStore, logger: logger)
+        await diagnostics.initialize()
+        let lifecycle = LifecycleStateMachine { event in
+            Task {
+                var attributes = [
+                    "from": event.from.rawValue,
+                    "to": event.to.rawValue,
+                    "accepted": event.accepted ? "true" : "false"
+                ]
+                if let reason = event.reason {
+                    attributes["reason"] = reason
+                }
+
+                await diagnostics.emit(
+                    DiagnosticEvent(
+                        name: event.accepted ? "lifecycle_transition" : "lifecycle_transition_rejected",
+                        sessionID: event.sessionID,
+                        attributes: attributes,
+                        timestamp: event.timestamp,
+                        level: event.accepted ? .debug : .error
+                    )
+                )
+            }
+        }
+        await diagnostics.emit(
+            DiagnosticEvent(
+                name: "app_bootstrap_started",
+                sessionID: nil,
+                attributes: [
+                    "process_id": String(ProcessInfo.processInfo.processIdentifier),
+                    "os_version": ProcessInfo.processInfo.operatingSystemVersionString
+                ]
+            )
+        )
         if await historyStore.recoveredDatabaseOnStartup() {
             await diagnostics.emit(
                 DiagnosticEvent(
@@ -139,7 +171,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let transcriptionPipeline = TranscriptionPipeline(
             providers: [groqProvider, openAIProvider, azureSpeechProvider, openRouterProvider, elevenLabsProvider, whisperCppProvider],
-            requestTimeoutSeconds: bootSettings.provider.timeoutSeconds
+            requestTimeoutSeconds: bootSettings.provider.timeoutSeconds,
+            diagnostics: diagnostics
         )
 
         let outputRouter = OutputRouter()
@@ -184,7 +217,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.showHistory(
                     historyStore: historyStore,
                     transcriptionPipeline: transcriptionPipeline,
-                    configurationManager: configurationManager
+                    configurationManager: configurationManager,
+                    diagnostics: diagnostics
                 )
             case .openSettings:
                 Task {
@@ -331,12 +365,14 @@ Move the app to /Applications and reopen it. Running translocated can break perm
     private func showHistory(
         historyStore: HistoryStore,
         transcriptionPipeline: TranscriptionPipeline,
-        configurationManager: ConfigurationManager
+        configurationManager: ConfigurationManager,
+        diagnostics: DiagnosticsCenter
     ) {
         let view = HistoryView(
             historyStore: historyStore,
             transcriptionPipeline: transcriptionPipeline,
-            configurationManager: configurationManager
+            configurationManager: configurationManager,
+            diagnostics: diagnostics
         )
         let controller = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: controller)
