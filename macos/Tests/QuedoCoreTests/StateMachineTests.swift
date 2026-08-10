@@ -122,4 +122,34 @@ final class StateMachineTests: XCTestCase {
         let contract = LifecycleStateMachine.uiContract(for: .ready, degradedReason: nil)
         XCTAssertTrue(contract.actions.contains(.history))
     }
+
+    func testRecoveringAudioIsDistinctFromConfirmedRecording() async throws {
+        let machine = LifecycleStateMachine()
+        try await machine.transition(to: .ready)
+        try await machine.beginSession(id: UUID())
+        try await machine.transition(to: .arming)
+        try await machine.transition(to: .recording)
+        try await machine.transition(to: .recoveringAudio)
+
+        let snapshot = await machine.snapshot()
+        XCTAssertEqual(snapshot.phase, .recoveringAudio)
+
+        let contract = await machine.uiContract()
+        XCTAssertEqual(contract.notificationCopy, "Microphone interrupted. Recovering audio; recording is paused.")
+        XCTAssertFalse(contract.actions.contains(.stop))
+        XCTAssertTrue(contract.actions.contains(.cancel))
+
+        try await machine.transition(to: .recording)
+        let recoveredSnapshot = await machine.snapshot()
+        XCTAssertEqual(recoveredSnapshot.phase, .recording)
+    }
+
+    func testCaptureRecoveryFailureContractWarnsThatAudioIsNotRecording() {
+        let contract = LifecycleStateMachine.uiContract(
+            for: .retryAvailable,
+            degradedReason: nil,
+            lastErrorCode: "capture_recovery_failed"
+        )
+        XCTAssertEqual(contract.notificationCopy, "Microphone capture stopped. No audio is being recorded.")
+    }
 }

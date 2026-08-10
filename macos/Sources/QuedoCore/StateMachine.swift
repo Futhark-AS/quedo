@@ -12,6 +12,8 @@ public enum AppPhase: String, Codable, Sendable {
     case arming
     /// Recording live audio.
     case recording
+    /// Audio capture was interrupted and is being rebuilt.
+    case recoveringAudio
     /// Processing recorded audio.
     case processing
     /// Receiving partial transcription updates.
@@ -267,11 +269,15 @@ public actor LifecycleStateMachine {
 
     /// Returns UI contract for the current phase snapshot.
     public func uiContract() -> UIStateContract {
-        Self.uiContract(for: phase, degradedReason: degradedReason)
+        Self.uiContract(for: phase, degradedReason: degradedReason, lastErrorCode: lastErrorCode)
     }
 
     /// Returns UI contract for any provided phase and degraded reason.
-    public static func uiContract(for phase: AppPhase, degradedReason: DegradedReason?) -> UIStateContract {
+    public static func uiContract(
+        for phase: AppPhase,
+        degradedReason: DegradedReason?,
+        lastErrorCode: String? = nil
+    ) -> UIStateContract {
         switch phase {
         case .ready:
             return UIStateContract(
@@ -290,6 +296,12 @@ public actor LifecycleStateMachine {
                 icon: "record.circle.fill",
                 notificationCopy: "Recording. Press shortcut to stop.",
                 actions: [.stop, .cancel]
+            )
+        case .recoveringAudio:
+            return UIStateContract(
+                icon: "mic.circle.badge.exclamationmark",
+                notificationCopy: "Microphone interrupted. Recovering audio; recording is paused.",
+                actions: [.cancel]
             )
         case .processing:
             return UIStateContract(
@@ -316,9 +328,16 @@ public actor LifecycleStateMachine {
                 actions: []
             )
         case .retryAvailable:
+            let copy: String
+            switch lastErrorCode {
+            case "capture_open_failed", "capture_recovery_failed":
+                copy = "Microphone capture stopped. No audio is being recorded."
+            default:
+                copy = "Could not complete. Retry is available."
+            }
             return UIStateContract(
                 icon: "arrow.clockwise",
-                notificationCopy: "Could not complete. Retry is available.",
+                notificationCopy: copy,
                 actions: [.retry, .switchProvider, .viewDiagnostics]
             )
         case .degraded:
@@ -383,6 +402,12 @@ public actor LifecycleStateMachine {
         case (.recording, .processing):
             return true
         case (.recording, .ready):
+            return true
+        case (.recording, .recoveringAudio):
+            return true
+        case (.recoveringAudio, .recording), (.recoveringAudio, .processing):
+            return true
+        case (.recoveringAudio, .retryAvailable), (.recoveringAudio, .ready):
             return true
         case (.processing, .streamingPartial), (.processing, .outputting), (.processing, .providerFallback):
             return true

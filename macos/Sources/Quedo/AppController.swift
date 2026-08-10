@@ -506,7 +506,7 @@ actor AppControllerActor {
                 return
             }
             await markWorkflowProgress(stage: "audio_started_waiting_for_first_frame", phase: "arming")
-            let armed = await audioEngine.waitForFirstFrame(timeout: .seconds(2))
+            let armed = await audioEngine.waitForFirstFrame(timeout: .seconds(5))
             guard isWorkflowActive(operationID), workflowAction == .starting else {
                 if isWorkflowActive(operationID) {
                     await audioEngine.cancelRecording()
@@ -559,7 +559,9 @@ actor AppControllerActor {
                 DiagnosticEvent(
                     name: "recording_started",
                     sessionID: sessionID,
-                    attributes: profile.map { ["profile": $0.id] } ?? [:],
+                    attributes: (profile.map { ["profile": $0.id] } ?? [:]).merging([
+                        "audio_confirmed": "true"
+                    ]) { current, _ in current },
                     operationID: operationID
                 )
             )
@@ -872,11 +874,31 @@ actor AppControllerActor {
             isRecording = false
             let failedSettings = transcriptionSettings
             let failedOverrides = transcriptionOverrides
-            let detail: String
+            var detail: String
             if failureStage == "transcription" {
                 detail = transcriptionFailureMessage(error: error, settings: failedSettings, modelOverrides: failedOverrides)
             } else {
                 detail = workflowFailureMessage(stage: failureStage, error: error)
+            }
+
+            let capturePreservedAt = Date()
+            if failureStage == "audio capture",
+               let recoverableCapture = await audioEngine.takeRecoverableCapture(),
+               let preservedCapture = await preserveFailedCapture(
+                   recoverableCapture,
+                   settings: failedSettings,
+                   createdAt: capturePreservedAt
+               )
+            {
+                latestAudio = preservedCapture
+                latestAudioSettings = failedSettings
+                latestAudioModelOverrides = failedOverrides
+                latestRetryContext = TranscriptionRetryContext(
+                    settings: failedSettings,
+                    modelOverrides: failedOverrides,
+                    createdAt: capturePreservedAt
+                )
+                detail += "\n\nPartial audio captured before the microphone interruption was preserved and can be retried."
             }
             latestErrorDetail = detail
             await diagnostics.emit(
@@ -939,7 +961,7 @@ actor AppControllerActor {
                 )
             )
             try? await lifecycle.transition(to: .retryAvailable)
-            await lifecycle.setLastErrorCode(errorCode(forFailureStage: failureStage))
+            await lifecycle.setLastErrorCode(errorCode(forFailureStage: failureStage, error: error))
             await lifecycle.endSession()
             try? await historyStore.updateSessionStatus(sessionID: sessionID, status: .retryAvailable)
             await endWorkflowTrace(operationID: operationID, outcome: "failed", phase: "retryAvailable", stage: "failed")
@@ -1173,7 +1195,7 @@ actor AppControllerActor {
                 )
             )
             try? await lifecycle.transition(to: .retryAvailable)
-            await lifecycle.setLastErrorCode(errorCode(forFailureStage: failureStage))
+            await lifecycle.setLastErrorCode(errorCode(forFailureStage: failureStage, error: error))
             await lifecycle.endSession()
             try? await historyStore.updateSessionStatus(sessionID: sessionID, status: .retryAvailable)
             await endWorkflowTrace(operationID: operationID, outcome: "failed", phase: "retryAvailable", stage: "retry_failed")
@@ -1459,7 +1481,7 @@ actor AppControllerActor {
         workflowWatchdogTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
-                    try await Task.sleep(for: .seconds(5))
+                    try await Task.sleep(for: .milliseconds(250))
                 } catch {
                     return
                 }
@@ -1541,30 +1563,135 @@ actor AppControllerActor {
         }
 
         let runtimeSnapshot = await diagnostics.runtimeSnapshot()
-        let phase = lifecycleSnapshot.phase
+        var phase = lifecycleSnapshot.phase
         let lastProgressAt = runtimeSnapshot.lastProgressAt ?? workflowLastProgressAt ?? Date()
         let stage = runtimeSnapshot.stage == "startup" ? workflowStage : runtimeSnapshot.stage
 
-        if phase == .recording {
+        if phase == .recording || phase == .recoveringAudio {
             let audio = await audioEngine.healthSnapshot()
-            if let pendingErrorCode = audio.pendingErrorCode, !workflowAudioErrorReported {
-                workflowAudioErrorReported = true
+
+            if audio.isRecovering {
+                if phase == .recording {
+                    try? await lifecycle.transition(to: .recoveringAudio)
+                    phase = .recoveringAudio
+                    await diagnostics.emit(
+                        DiagnosticEvent(
+                            name: "audio_capture_recovery_started",
+                            sessionID: sessionID,
+                            attributes: [
+                                "reason": audio.recoveryReason ?? "unknown",
+                                "attempt": String(audio.recoveryAttempt),
+                                "engine_running": audio.engineRunning ? "true" : "false",
+                                "writer_ready": audio.writerReady ? "true" : "false"
+                            ],
+                            operationID: workflowOperationID,
+                            level: .warning
+                        )
+                    )
+                }
+                await markWorkflowProgress(
+                    stage: "audio_recovering",
+                    phase: phase.rawValue,
+                    details: ["attempt": String(audio.recoveryAttempt)]
+                )
+                await pushUI()
+                return
+            }
+
+            if phase == .recoveringAudio {
+                if let pendingErrorCode = audio.pendingErrorCode {
+                    if !workflowAudioErrorReported {
+                        workflowAudioErrorReported = true
+                        await diagnostics.emit(
+                            DiagnosticEvent(
+                                name: "audio_capture_error_detected",
+                                sessionID: sessionID,
+                                attributes: [
+                                    "error_code": pendingErrorCode,
+                                    "engine_running": audio.engineRunning ? "true" : "false",
+                                    "writer_ready": audio.writerReady ? "true" : "false"
+                                ],
+                                operationID: workflowOperationID,
+                                level: .error
+                            )
+                        )
+                    }
+                    if workflowAction == nil {
+                        await diagnostics.emit(
+                            DiagnosticEvent(
+                                name: "audio_capture_recovery_exhausted",
+                                sessionID: sessionID,
+                                attributes: ["error_code": pendingErrorCode],
+                                operationID: workflowOperationID,
+                                level: .error
+                            )
+                        )
+                        await stopRecordingFlow()
+                    }
+                    return
+                }
+
+                guard audio.lastFrameAt != nil else {
+                    return
+                }
+
+                try? await lifecycle.transition(to: .recording)
+                phase = .recording
+                await markWorkflowProgress(
+                    stage: "audio_recovered",
+                    phase: phase.rawValue,
+                    details: ["recovery_attempt": String(audio.recoveryAttempt)]
+                )
                 await diagnostics.emit(
                     DiagnosticEvent(
-                        name: "audio_capture_error_detected",
+                        name: "audio_capture_recovered",
                         sessionID: sessionID,
                         attributes: [
-                            "error_code": pendingErrorCode,
                             "engine_running": audio.engineRunning ? "true" : "false",
                             "writer_ready": audio.writerReady ? "true" : "false"
                         ],
-                        operationID: workflowOperationID,
-                        level: .error
+                        operationID: workflowOperationID
                     )
                 )
+                await pushUI()
+                return
             }
 
-            if let lastFrameAt = audio.lastFrameAt, lastFrameAt > lastProgressAt {
+            if let pendingErrorCode = audio.pendingErrorCode {
+                if !workflowAudioErrorReported {
+                    workflowAudioErrorReported = true
+                    await diagnostics.emit(
+                        DiagnosticEvent(
+                            name: "audio_capture_error_detected",
+                            sessionID: sessionID,
+                            attributes: [
+                                "error_code": pendingErrorCode,
+                                "engine_running": audio.engineRunning ? "true" : "false",
+                                "writer_ready": audio.writerReady ? "true" : "false"
+                            ],
+                            operationID: workflowOperationID,
+                            level: .error
+                        )
+                    )
+                }
+                if workflowAction == nil {
+                    await diagnostics.emit(
+                        DiagnosticEvent(
+                            name: "audio_capture_recovery_exhausted",
+                            sessionID: sessionID,
+                            attributes: ["error_code": pendingErrorCode],
+                            operationID: workflowOperationID,
+                            level: .error
+                        )
+                    )
+                    await stopRecordingFlow()
+                }
+                return
+            }
+
+            if let lastFrameAt = audio.lastFrameAt,
+               lastFrameAt.timeIntervalSince(lastProgressAt) >= 1
+            {
                 workflowLastProgressAt = lastFrameAt
                 await diagnostics.markSessionProgress(
                     sessionID: sessionID,
@@ -1579,6 +1706,10 @@ actor AppControllerActor {
                 )
                 return
             }
+        }
+
+        if phase == .recoveringAudio {
+            return
         }
 
         let ageSeconds = Date().timeIntervalSince(lastProgressAt)
@@ -1615,6 +1746,8 @@ actor AppControllerActor {
             return 8
         case .recording:
             return 8
+        case .recoveringAudio:
+            return 10
         case .processing, .providerFallback:
             return max(90, TimeInterval(settings.provider.timeoutSeconds * 10))
         case .outputting:
@@ -1759,7 +1892,28 @@ Next steps:
     }
 
     private func workflowFailureMessage(stage: String, error: Error) -> String {
-        """
+        if let audioError = error as? AudioCaptureError {
+            switch audioError {
+            case .callbackStalled:
+                return """
+                Microphone capture stopped unexpectedly.
+
+                Quedo attempted automatic audio recovery but could not confirm new microphone frames. No audio is being recorded.
+
+                Next steps:
+                - The captured portion, if any, was preserved for retry.
+                - Check the selected input device and run Checks from the menu bar.
+                """
+            case .noInputDevice:
+                return "No microphone input device was available. No audio is being recorded."
+            case .writerFailed:
+                return "Quedo could not write microphone audio. No audio is being recorded."
+            default:
+                break
+            }
+        }
+
+        return """
         \(stage.capitalized) failed.
 
         Reason: \(sanitizedDiagnostic(error))
@@ -1770,13 +1924,58 @@ Next steps:
         """
     }
 
+    private func preserveFailedCapture(
+        _ capture: AudioCaptureResult,
+        settings: AppSettings,
+        createdAt: Date
+    ) async -> AudioCaptureResult? {
+        let pendingRecord = SessionRecord(
+            sessionID: capture.sessionID,
+            createdAt: createdAt,
+            durationMS: capture.durationMS,
+            providerPrimary: settings.provider.primary,
+            providerUsed: settings.provider.primary,
+            language: settings.language,
+            outputMode: settings.outputMode,
+            status: .retryAvailable,
+            transcript: "",
+            audioPath: capture.fileURL
+        )
+
+        do {
+            let durableURL = try await historyStore.saveSession(pendingRecord)
+            return AudioCaptureResult(
+                sessionID: capture.sessionID,
+                fileURL: durableURL,
+                durationMS: capture.durationMS
+            )
+        } catch {
+            await diagnostics.emit(
+                DiagnosticEvent(
+                    name: "partial_audio_history_save_failed",
+                    sessionID: capture.sessionID,
+                    attributes: diagnosticAttributes(for: error),
+                    level: .error
+                )
+            )
+            guard let recoveredURL = recoverAudioForManualImport(capture) else {
+                return nil
+            }
+            return AudioCaptureResult(
+                sessionID: capture.sessionID,
+                fileURL: recoveredURL,
+                durationMS: capture.durationMS
+            )
+        }
+    }
+
     private func recoverAudioForManualImport(_ capture: AudioCaptureResult) -> URL? {
         let fileManager = FileManager.default
         let baseURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Quedo", isDirectory: true)
         let recoveredDirectory = baseURL.appendingPathComponent("recovered", isDirectory: true)
         let recoveredURL = recoveredDirectory
-            .appendingPathComponent("\(capture.sessionID.uuidString)-history-save-failed")
+            .appendingPathComponent("\(capture.sessionID.uuidString)-capture-recovery")
             .appendingPathExtension(capture.fileURL.pathExtension.isEmpty ? "wav" : capture.fileURL.pathExtension)
 
         do {
@@ -1791,9 +1990,12 @@ Next steps:
         }
     }
 
-    private func errorCode(forFailureStage stage: String) -> String {
+    private func errorCode(forFailureStage stage: String, error: Error? = nil) -> String {
         switch stage {
         case "audio capture":
+            if let audioError = error as? AudioCaptureError, audioError == .callbackStalled {
+                return "capture_recovery_failed"
+            }
             return "capture_open_failed"
         case "history pre-save", "history save":
             return "history_save_failed"

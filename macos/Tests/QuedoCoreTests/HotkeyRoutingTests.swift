@@ -35,6 +35,17 @@ final class HotkeyRoutingTests: XCTestCase {
         XCTAssertEqual(command, .none)
     }
 
+    func testToggleModeCancelsWhenAudioIsRecovering() {
+        let command = HotkeyRouting.toggleCommand(
+            mode: .toggle,
+            event: .pressed,
+            phase: .recoveringAudio,
+            isRecording: true,
+            hasActiveSession: true
+        )
+        XCTAssertEqual(command, .cancelArming)
+    }
+
     func testHoldModeStartsOnPressedWhenReady() {
         let command = HotkeyRouting.toggleCommand(
             mode: .hold,

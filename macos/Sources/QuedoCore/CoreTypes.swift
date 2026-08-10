@@ -101,7 +101,7 @@ public enum HotkeyRouting {
             guard event == .pressed else {
                 return .none
             }
-            if phase == .arming {
+            if phase == .arming || phase == .recoveringAudio {
                 return .cancelArming
             }
             if isRecording {
@@ -119,7 +119,7 @@ public enum HotkeyRouting {
                 }
                 return .none
             case .released:
-                if phase == .arming {
+                if phase == .arming || phase == .recoveringAudio {
                     return .cancelArming
                 }
                 if isRecording {
