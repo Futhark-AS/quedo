@@ -56,6 +56,12 @@ public struct AudioCaptureHealthSnapshot: Sendable {
     public let engineRunning: Bool
     /// Whether an audio file writer is installed.
     public let writerReady: Bool
+    /// Whether the engine is currently rebuilding after an audio interruption.
+    public let isRecovering: Bool
+    /// One-based recovery attempt, or zero when recovery is idle.
+    public let recoveryAttempt: Int
+    /// Trigger that caused the current recovery attempt.
+    public let recoveryReason: String?
 
     /// Creates a health snapshot.
     public init(
@@ -64,7 +70,10 @@ public struct AudioCaptureHealthSnapshot: Sendable {
         lastFrameAt: Date?,
         pendingErrorCode: String?,
         engineRunning: Bool,
-        writerReady: Bool
+        writerReady: Bool,
+        isRecovering: Bool = false,
+        recoveryAttempt: Int = 0,
+        recoveryReason: String? = nil
     ) {
         self.sessionID = sessionID
         self.startedAt = startedAt
@@ -72,6 +81,9 @@ public struct AudioCaptureHealthSnapshot: Sendable {
         self.pendingErrorCode = pendingErrorCode
         self.engineRunning = engineRunning
         self.writerReady = writerReady
+        self.isRecovering = isRecovering
+        self.recoveryAttempt = recoveryAttempt
+        self.recoveryReason = recoveryReason
     }
 }
 
@@ -125,14 +137,23 @@ public actor AudioCaptureEngine {
     private let workingDirectory: URL
     private var engine: AVAudioEngine
     private var writer: AVAudioFile?
+    private var outputURL: URL?
     private var sessionID: UUID?
     private var startedAt: Date?
     private var lastFrameAt: Date?
+    private var hasReceivedFrame = false
     private var watchdogTask: Task<Void, Never>?
     private var armingWatchdogTask: Task<Void, Never>?
     private var pendingError: AudioCaptureError?
+    private var isRecovering = false
+    private var recoveryAttempt = 0
+    private var recoveryReason: String?
+    private var lastRecoverableCapture: AudioCaptureResult?
     private var observers: [NSObjectProtocol] = []
     private var observersInstalled = false
+
+    private static let callbackStallThreshold: TimeInterval = 0.75
+    private static let maxRecoveryAttempts = 3
 
     /// Creates capture engine.
     public init(fileManager: FileManager = .default) {
@@ -154,7 +175,10 @@ public actor AudioCaptureEngine {
             lastFrameAt: lastFrameAt,
             pendingErrorCode: pendingError?.diagnosticCode,
             engineRunning: engine.isRunning,
-            writerReady: writer != nil
+            writerReady: writer != nil,
+            isRecovering: isRecovering,
+            recoveryAttempt: recoveryAttempt,
+            recoveryReason: recoveryReason
         )
     }
 
@@ -165,6 +189,13 @@ public actor AudioCaptureEngine {
         guard self.sessionID == nil else {
             throw AudioCaptureError.alreadyRecording
         }
+
+        lastRecoverableCapture = nil
+        outputURL = nil
+        hasReceivedFrame = false
+        recoveryAttempt = 0
+        isRecovering = false
+        recoveryReason = nil
 
         var lastError: Error?
         for attempt in 0..<2 {
@@ -184,6 +215,8 @@ public actor AudioCaptureEngine {
         if (lastError as? AudioCaptureError) == .noInputDevice {
             throw AudioCaptureError.noInputDevice
         }
+        writer = nil
+        outputURL = nil
         throw AudioCaptureError.streamOpenFailed
     }
 
@@ -217,14 +250,27 @@ public actor AudioCaptureEngine {
             throw AudioCaptureError.notRecording
         }
 
+        while isRecovering {
+            try? await Task.sleep(for: .milliseconds(25))
+            guard self.sessionID == activeSessionID else {
+                throw AudioCaptureError.notRecording
+            }
+        }
+
         let stopSucceeded = await stopWithWatchdog(timeoutSeconds: 2)
         if !stopSucceeded {
+            lastRecoverableCapture = makeRecoverableCapture()
             replaceEngineAfterStopTimeout()
             endWatchdogs()
             writer = nil
+            outputURL = nil
             self.sessionID = nil
             self.startedAt = nil
             self.lastFrameAt = nil
+            hasReceivedFrame = false
+            isRecovering = false
+            recoveryAttempt = 0
+            recoveryReason = nil
             pendingError = nil
             throw AudioCaptureError.stopTimedOut
         }
@@ -232,32 +278,57 @@ public actor AudioCaptureEngine {
         endWatchdogs()
 
         if let pendingError {
+            lastRecoverableCapture = makeRecoverableCapture()
             self.pendingError = nil
             self.sessionID = nil
             self.startedAt = nil
             self.lastFrameAt = nil
+            hasReceivedFrame = false
             writer = nil
+            outputURL = nil
+            isRecovering = false
+            recoveryAttempt = 0
+            recoveryReason = nil
             throw pendingError
         }
 
         writer = nil
+        outputURL = nil
         self.sessionID = nil
+        hasReceivedFrame = false
+        isRecovering = false
+        recoveryAttempt = 0
+        recoveryReason = nil
 
         let durationMS = Int(Date().timeIntervalSince(startedAt) * 1000)
         self.startedAt = nil
-        let path = workingDirectory.appendingPathComponent(activeSessionID.uuidString).appendingPathExtension("wav")
+        let path = workingDirectory
+            .appendingPathComponent(activeSessionID.uuidString)
+            .appendingPathExtension("wav")
         return AudioCaptureResult(sessionID: activeSessionID, fileURL: path, durationMS: max(durationMS, 0))
+    }
+
+    /// Returns audio captured before a failed stop/recovery, once.
+    public func takeRecoverableCapture() -> AudioCaptureResult? {
+        defer { lastRecoverableCapture = nil }
+        return lastRecoverableCapture
     }
 
     /// Cancels recording and tears down resources.
     public func cancelRecording() {
+        sessionID = nil
         teardownEngine(force: true)
         endWatchdogs()
-        sessionID = nil
         startedAt = nil
         lastFrameAt = nil
+        hasReceivedFrame = false
         writer = nil
+        outputURL = nil
         pendingError = nil
+        isRecovering = false
+        recoveryAttempt = 0
+        recoveryReason = nil
+        lastRecoverableCapture = nil
     }
 
     private func ensureEnvironmentObserversInstalled() {
@@ -293,20 +364,38 @@ public actor AudioCaptureEngine {
 
         let outputFile = try AVAudioFile(forWriting: outputURL, settings: settings)
         writer = outputFile
+        self.outputURL = outputURL
+
+        try installInputTapAndStart(outputFile: outputFile, sessionID: sessionID)
+
+        self.sessionID = sessionID
+        self.startedAt = Date()
+        self.lastFrameAt = nil
+        self.hasReceivedFrame = false
+        self.pendingError = nil
+    }
+
+    private func installInputTapAndStart(outputFile: AVAudioFile, sessionID: UUID) throws {
+        let input = engine.inputNode
+        let format = input.inputFormat(forBus: 0)
+        guard format.channelCount > 0 else {
+            throw AudioCaptureError.noInputDevice
+        }
 
         input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             guard let self else {
                 return
             }
+            let captureSessionID = sessionID
             do {
                 try outputFile.write(from: buffer)
                 Task {
-                    await self.markFrameReceived()
+                    await self.markFrameReceived(for: captureSessionID)
                 }
             } catch {
                 Task {
-                    await self.markWriterFailure()
+                    await self.markWriterFailure(for: captureSessionID)
                 }
             }
         }
@@ -317,11 +406,6 @@ public actor AudioCaptureEngine {
         } catch {
             throw AudioCaptureError.streamOpenFailed
         }
-
-        self.sessionID = sessionID
-        self.startedAt = Date()
-        self.lastFrameAt = nil
-        self.pendingError = nil
     }
 
     private func stopWithWatchdog(timeoutSeconds: TimeInterval) async -> Bool {
@@ -361,24 +445,16 @@ public actor AudioCaptureEngine {
         watchdogTask = nil
     }
 
-    private func handleArmingWatchdog() {
-        guard sessionID != nil else {
+    private func handleArmingWatchdog() async {
+        guard sessionID != nil, lastFrameAt == nil, !isRecovering else {
             return
         }
 
-        if lastFrameAt == nil {
-            engine.stop()
-            prepareEngineIfPossible()
-            do {
-                try engine.start()
-            } catch {
-                pendingError = .streamOpenFailed
-            }
-        }
+        await recoverAudioEngine(reason: "first_frame_timeout")
     }
 
-    private func handleCallbackWatchdog() {
-        guard sessionID != nil else {
+    private func handleCallbackWatchdog() async {
+        guard sessionID != nil, !isRecovering, pendingError == nil else {
             return
         }
 
@@ -386,18 +462,110 @@ public actor AudioCaptureEngine {
             return
         }
 
-        if Date().timeIntervalSince(lastFrameAt) > 0.75 {
-            pendingError = .callbackStalled
-            teardownEngine(force: true)
+        if !engine.isRunning || Date().timeIntervalSince(lastFrameAt) > Self.callbackStallThreshold {
+            await recoverAudioEngine(reason: "callback_stalled")
         }
     }
 
-    private func markFrameReceived() {
-        lastFrameAt = Date()
+    private func recoverAudioEngine(reason: String) async {
+        guard let activeSessionID = sessionID, !isRecovering, pendingError == nil else {
+            return
+        }
+
+        isRecovering = true
+        recoveryReason = reason
+        pendingError = nil
+        var lastError: AudioCaptureError = .streamOpenFailed
+
+        for attempt in 1...Self.maxRecoveryAttempts {
+            guard sessionID == activeSessionID else {
+                isRecovering = false
+                recoveryAttempt = 0
+                recoveryReason = nil
+                return
+            }
+
+            recoveryAttempt = attempt
+            lastFrameAt = nil
+            teardownEngine(force: true)
+            try? await Task.sleep(for: .milliseconds(attempt == 1 ? 100 : 250))
+
+            guard sessionID == activeSessionID else {
+                isRecovering = false
+                recoveryAttempt = 0
+                recoveryReason = nil
+                return
+            }
+
+            do {
+                guard let existingWriter = writer else {
+                    throw AudioCaptureError.streamOpenFailed
+                }
+                try installInputTapAndStart(outputFile: existingWriter, sessionID: activeSessionID)
+                if await waitForFirstFrame(timeout: .seconds(1)) {
+                    isRecovering = false
+                    recoveryAttempt = 0
+                    recoveryReason = nil
+                    pendingError = nil
+                    return
+                }
+                lastError = pendingError ?? .callbackStalled
+            } catch let error as AudioCaptureError {
+                lastError = error
+            } catch {
+                lastError = .streamOpenFailed
+            }
+        }
+
+        isRecovering = false
+        recoveryAttempt = 0
+        recoveryReason = nil
+        pendingError = switch lastError {
+        case .noInputDevice:
+            .noInputDevice
+        case .writerFailed:
+            .writerFailed
+        default:
+            .callbackStalled
+        }
+        teardownEngine(force: true)
+        lastRecoverableCapture = makeRecoverableCapture()
     }
 
-    private func markWriterFailure() {
+    private func markFrameReceived(for sessionID: UUID) {
+        guard self.sessionID == sessionID else {
+            return
+        }
+        lastFrameAt = Date()
+        hasReceivedFrame = true
+    }
+
+    private func markWriterFailure(for sessionID: UUID) {
+        guard self.sessionID == sessionID else {
+            return
+        }
         pendingError = .writerFailed
+    }
+
+    private func makeRecoverableCapture() -> AudioCaptureResult? {
+        guard
+            let sessionID,
+            let startedAt,
+            let outputURL,
+            hasReceivedFrame,
+            fileManager.fileExists(atPath: outputURL.path),
+            let attributes = try? fileManager.attributesOfItem(atPath: outputURL.path),
+            let fileSize = attributes[.size] as? NSNumber,
+            fileSize.int64Value > 44
+        else {
+            return nil
+        }
+
+        return AudioCaptureResult(
+            sessionID: sessionID,
+            fileURL: outputURL,
+            durationMS: max(Int(Date().timeIntervalSince(startedAt) * 1000), 0)
+        )
     }
 
     private func teardownEngine(force: Bool) {
@@ -441,11 +609,11 @@ public actor AudioCaptureEngine {
         observers.append(didWake)
     }
 
-    private func handleRouteChange() {
+    private func handleRouteChange() async {
         guard sessionID != nil else {
             return
         }
-        pendingError = .streamOpenFailed
+        await recoverAudioEngine(reason: "route_changed")
     }
 
     private func handleSystemSleep() {

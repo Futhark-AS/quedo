@@ -98,6 +98,9 @@ final class MenuBarController: NSObject {
             return
         }
 
+        button.toolTip = lastContract?.notificationCopy ?? "Quedo ready"
+        button.setAccessibilityLabel(lastContract?.notificationCopy ?? "Quedo")
+
         if isProcessingAnimationPhase(phase) {
             startProcessingAnimation()
             button.title = ""
