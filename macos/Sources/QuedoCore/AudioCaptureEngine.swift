@@ -14,6 +14,8 @@ public enum AudioCaptureError: Error, Sendable {
     case noInputDevice
     /// No frames were observed in watchdog window.
     case callbackStalled
+    /// Audio engine start exceeded its safety timeout.
+    case startTimedOut
     /// Stop operation timed out.
     case stopTimedOut
     /// Audio file writer failed.
@@ -34,6 +36,8 @@ public extension AudioCaptureError {
             return "no_input_device"
         case .callbackStalled:
             return "callback_stalled"
+        case .startTimedOut:
+            return "start_timed_out"
         case .stopTimedOut:
             return "stop_timed_out"
         case .writerFailed:
@@ -104,17 +108,204 @@ public struct AudioCaptureResult: Sendable {
     }
 }
 
-/// Performs a potentially blocking AVAudioEngine stop away from the actor.
+private struct AudioEngineStartResult: @unchecked Sendable {
+    let writer: AVAudioFile
+    let outputURL: URL
+}
+
+/// Runs potentially blocking AVAudioEngine setup away from the actor.
 ///
-/// The engine instance is intentionally captured by this operation. If the
-/// stop exceeds its budget, the owning actor can replace its engine safely
-/// while this operation finishes against the old instance.
-private final class AudioEngineStopOperation: @unchecked Sendable {
+/// Core Audio can block indefinitely while it is reconciling an input-device
+/// route change. Keeping this work off the actor means cancellation, watchdogs,
+/// and UI updates remain responsive even when that happens.
+private final class AudioEngineStartOperation: @unchecked Sendable {
+    enum Completion: @unchecked Sendable {
+        case succeeded(AudioEngineStartResult)
+        case failed(AudioCaptureError)
+    }
+
+    private let engine: AVAudioEngine
+    private let outputURL: URL
+    private let sessionID: UUID
+    private let existingWriter: AVAudioFile?
+    private let onFrame: @Sendable (UUID) -> Void
+    private let onWriterFailure: @Sendable (UUID) -> Void
+    private let group = DispatchGroup()
+    private let lock = NSLock()
+    private var completion: Completion?
+    private var cancelled = false
+
+    init(
+        engine: AVAudioEngine,
+        outputURL: URL,
+        sessionID: UUID,
+        existingWriter: AVAudioFile? = nil,
+        onFrame: @escaping @Sendable (UUID) -> Void,
+        onWriterFailure: @escaping @Sendable (UUID) -> Void
+    ) {
+        self.engine = engine
+        self.outputURL = outputURL
+        self.sessionID = sessionID
+        self.existingWriter = existingWriter
+        self.onFrame = onFrame
+        self.onWriterFailure = onWriterFailure
+    }
+
+    func start() {
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            defer { group.leave() }
+
+            do {
+                guard !isCancelled() else {
+                    finish(.failed(.notRecording))
+                    return
+                }
+
+                let input = engine.inputNode
+                let format = input.inputFormat(forBus: 0)
+                guard format.channelCount > 0 else {
+                    finish(.failed(.noInputDevice))
+                    return
+                }
+
+                let outputFile: AVAudioFile
+                if let existingWriter {
+                    outputFile = existingWriter
+                } else {
+                    let settings: [String: Any] = [
+                        AVFormatIDKey: kAudioFormatLinearPCM,
+                        AVSampleRateKey: format.sampleRate,
+                        AVNumberOfChannelsKey: Int(format.channelCount),
+                        AVLinearPCMBitDepthKey: 16,
+                        AVLinearPCMIsFloatKey: false,
+                        AVLinearPCMIsBigEndianKey: false
+                    ]
+                    outputFile = try AVAudioFile(forWriting: outputURL, settings: settings)
+                }
+
+                guard !isCancelled() else {
+                    finish(.failed(.notRecording))
+                    return
+                }
+
+                input.removeTap(onBus: 0)
+                input.installTap(onBus: 0, bufferSize: 1024, format: format) { [outputFile, sessionID, onFrame, onWriterFailure] buffer, _ in
+                    do {
+                        try outputFile.write(from: buffer)
+                        onFrame(sessionID)
+                    } catch {
+                        onWriterFailure(sessionID)
+                    }
+                }
+
+                guard !isCancelled() else {
+                    input.removeTap(onBus: 0)
+                    engine.stop()
+                    finish(.failed(.notRecording))
+                    return
+                }
+
+                engine.prepare()
+                try engine.start()
+
+                guard !isCancelled() else {
+                    input.removeTap(onBus: 0)
+                    engine.stop()
+                    finish(.failed(.notRecording))
+                    return
+                }
+
+                finish(.succeeded(AudioEngineStartResult(writer: outputFile, outputURL: outputURL)))
+            } catch let error as AudioCaptureError {
+                finish(.failed(error))
+            } catch {
+                finish(.failed(.streamOpenFailed))
+            }
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    var wasCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func wait(timeoutSeconds: TimeInterval) -> Completion? {
+        guard group.wait(timeout: .now() + timeoutSeconds) == .success else {
+            return nil
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        return completion
+    }
+
+    private func isCancelled() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    private func finish(_ completion: Completion) {
+        lock.lock()
+        if self.completion == nil {
+            self.completion = completion
+        }
+        lock.unlock()
+    }
+}
+
+/// Runs potentially blocking AVAudioEngine preparation away from the actor.
+private final class AudioEnginePrepareOperation: @unchecked Sendable {
     private let engine: AVAudioEngine
     private let group = DispatchGroup()
+    private let lock = NSLock()
+    private var prepared: Bool?
 
     init(engine: AVAudioEngine) {
         self.engine = engine
+    }
+
+    func start() {
+        group.enter()
+        DispatchQueue.global(qos: .utility).async { [self] in
+            defer { group.leave() }
+            let inputFormat = engine.inputNode.inputFormat(forBus: 0)
+            let canPrepare = inputFormat.channelCount > 0
+            if canPrepare {
+                engine.prepare()
+            }
+            lock.lock()
+            prepared = canPrepare
+            lock.unlock()
+        }
+    }
+
+    func wait(timeoutSeconds: TimeInterval) -> Bool? {
+        guard group.wait(timeout: .now() + timeoutSeconds) == .success else {
+            return nil
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        return prepared
+    }
+}
+
+/// Runs potentially blocking AVAudioEngine teardown away from the actor.
+private final class AudioEngineTeardownOperation: @unchecked Sendable {
+    private let engine: AVAudioEngine
+    private let reset: Bool
+    private let group = DispatchGroup()
+
+    init(engine: AVAudioEngine, reset: Bool) {
+        self.engine = engine
+        self.reset = reset
     }
 
     func start() {
@@ -123,6 +314,9 @@ private final class AudioEngineStopOperation: @unchecked Sendable {
             defer { group.leave() }
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
+            if reset {
+                engine.reset()
+            }
         }
     }
 
@@ -136,6 +330,7 @@ public actor AudioCaptureEngine {
     private let fileManager: FileManager
     private let workingDirectory: URL
     private var engine: AVAudioEngine
+    private var engineRunning = false
     private var writer: AVAudioFile?
     private var outputURL: URL?
     private var sessionID: UUID?
@@ -149,6 +344,7 @@ public actor AudioCaptureEngine {
     private var recoveryAttempt = 0
     private var recoveryReason: String?
     private var lastRecoverableCapture: AudioCaptureResult?
+    private var activeStartOperation: AudioEngineStartOperation?
     private var observers: [NSObjectProtocol] = []
     private var observersInstalled = false
 
@@ -163,8 +359,19 @@ public actor AudioCaptureEngine {
     }
 
     /// Prepares the audio engine to reduce first-start latency.
-    public func prepareEngine() {
-        prepareEngineIfPossible()
+    public func prepareEngine() async {
+        guard activeStartOperation == nil, sessionID == nil else {
+            return
+        }
+        let operation = AudioEnginePrepareOperation(engine: engine)
+        operation.start()
+        let result = await Task.detached(priority: .utility) {
+            operation.wait(timeoutSeconds: 1)
+        }.value
+        if result == nil {
+            engine = AVAudioEngine()
+            engineRunning = false
+        }
     }
 
     /// Returns the latest audio-capture health without changing engine state.
@@ -174,7 +381,7 @@ public actor AudioCaptureEngine {
             startedAt: startedAt,
             lastFrameAt: lastFrameAt,
             pendingErrorCode: pendingError?.diagnosticCode,
-            engineRunning: engine.isRunning,
+            engineRunning: engineRunning,
             writerReady: writer != nil,
             isRecovering: isRecovering,
             recoveryAttempt: recoveryAttempt,
@@ -192,6 +399,7 @@ public actor AudioCaptureEngine {
 
         lastRecoverableCapture = nil
         outputURL = nil
+        engineRunning = false
         hasReceivedFrame = false
         recoveryAttempt = 0
         isRecovering = false
@@ -200,20 +408,25 @@ public actor AudioCaptureEngine {
         var lastError: Error?
         for attempt in 0..<2 {
             do {
-                try setupAndStart(sessionID: sessionID)
+                try await setupAndStart(sessionID: sessionID)
                 startWatchdogs()
                 return
             } catch {
+                if let audioError = error as? AudioCaptureError, audioError == .notRecording {
+                    throw audioError
+                }
                 lastError = error
-                teardownEngine(force: true)
+                _ = await replaceEngineAfterTeardown(timeoutSeconds: 1)
                 if attempt == 0 {
                     try? await Task.sleep(for: .milliseconds(300))
                 }
             }
         }
 
-        if (lastError as? AudioCaptureError) == .noInputDevice {
-            throw AudioCaptureError.noInputDevice
+        if let audioError = lastError as? AudioCaptureError {
+            if audioError == .noInputDevice || audioError == .startTimedOut {
+                throw audioError
+            }
         }
         writer = nil
         outputURL = nil
@@ -289,11 +502,15 @@ public actor AudioCaptureEngine {
             isRecovering = false
             recoveryAttempt = 0
             recoveryReason = nil
+            engineRunning = false
+            engine = AVAudioEngine()
             throw pendingError
         }
 
         writer = nil
         outputURL = nil
+        engineRunning = false
+        engine = AVAudioEngine()
         self.sessionID = nil
         hasReceivedFrame = false
         isRecovering = false
@@ -315,10 +532,19 @@ public actor AudioCaptureEngine {
     }
 
     /// Cancels recording and tears down resources.
-    public func cancelRecording() {
+    public func cancelRecording() async {
         sessionID = nil
-        teardownEngine(force: true)
+        activeStartOperation?.cancel()
+        activeStartOperation = nil
         endWatchdogs()
+        let oldEngine = engine
+        engine = AVAudioEngine()
+        engineRunning = false
+        let teardown = AudioEngineTeardownOperation(engine: oldEngine, reset: true)
+        teardown.start()
+        _ = await Task.detached(priority: .userInitiated) {
+            teardown.wait(timeoutSeconds: 1)
+        }.value
         startedAt = nil
         lastFrameAt = nil
         hasReceivedFrame = false
@@ -339,34 +565,55 @@ public actor AudioCaptureEngine {
         observersInstalled = true
     }
 
-    private func setupAndStart(sessionID: UUID) throws {
-        let input = engine.inputNode
-        let format = input.inputFormat(forBus: 0)
-
-        if format.channelCount == 0 {
-            throw AudioCaptureError.noInputDevice
-        }
-
+    private func setupAndStart(sessionID: UUID, existingWriter: AVAudioFile? = nil) async throws {
         try fileManager.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
-        let outputURL = workingDirectory.appendingPathComponent(sessionID.uuidString).appendingPathExtension("wav")
-        if fileManager.fileExists(atPath: outputURL.path) {
+        let outputURL = self.outputURL
+            ?? workingDirectory.appendingPathComponent(sessionID.uuidString).appendingPathExtension("wav")
+        if existingWriter == nil, fileManager.fileExists(atPath: outputURL.path) {
             try fileManager.removeItem(at: outputURL)
         }
 
-        let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVSampleRateKey: format.sampleRate,
-            AVNumberOfChannelsKey: Int(format.channelCount),
-            AVLinearPCMBitDepthKey: 16,
-            AVLinearPCMIsFloatKey: false,
-            AVLinearPCMIsBigEndianKey: false
-        ]
+        let operation = AudioEngineStartOperation(
+            engine: engine,
+            outputURL: outputURL,
+            sessionID: sessionID,
+            existingWriter: existingWriter,
+            onFrame: { [weak self] captureSessionID in
+                Task {
+                    await self?.markFrameReceived(for: captureSessionID)
+                }
+            },
+            onWriterFailure: { [weak self] captureSessionID in
+                Task {
+                    await self?.markWriterFailure(for: captureSessionID)
+                }
+            }
+        )
+        activeStartOperation = operation
+        operation.start()
+        let completion = await Task.detached(priority: .userInitiated) {
+            operation.wait(timeoutSeconds: 2)
+        }.value
+        if activeStartOperation === operation {
+            activeStartOperation = nil
+        }
 
-        let outputFile = try AVAudioFile(forWriting: outputURL, settings: settings)
-        writer = outputFile
-        self.outputURL = outputURL
+        guard let completion else {
+            operation.cancel()
+            throw AudioCaptureError.startTimedOut
+        }
+        guard !operation.wasCancelled else {
+            throw AudioCaptureError.notRecording
+        }
 
-        try installInputTapAndStart(outputFile: outputFile, sessionID: sessionID)
+        switch completion {
+        case let .succeeded(result):
+            writer = result.writer
+            self.outputURL = result.outputURL
+            engineRunning = true
+        case let .failed(error):
+            throw error
+        }
 
         self.sessionID = sessionID
         self.startedAt = Date()
@@ -375,41 +622,19 @@ public actor AudioCaptureEngine {
         self.pendingError = nil
     }
 
-    private func installInputTapAndStart(outputFile: AVAudioFile, sessionID: UUID) throws {
-        let input = engine.inputNode
-        let format = input.inputFormat(forBus: 0)
-        guard format.channelCount > 0 else {
-            throw AudioCaptureError.noInputDevice
-        }
-
-        input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            guard let self else {
-                return
-            }
-            let captureSessionID = sessionID
-            do {
-                try outputFile.write(from: buffer)
-                Task {
-                    await self.markFrameReceived(for: captureSessionID)
-                }
-            } catch {
-                Task {
-                    await self.markWriterFailure(for: captureSessionID)
-                }
-            }
-        }
-
-        prepareEngineIfPossible()
-        do {
-            try engine.start()
-        } catch {
-            throw AudioCaptureError.streamOpenFailed
-        }
+    private func stopWithWatchdog(timeoutSeconds: TimeInterval) async -> Bool {
+        let operation = AudioEngineTeardownOperation(engine: engine, reset: false)
+        operation.start()
+        return await Task.detached(priority: .userInitiated) {
+            operation.wait(timeoutSeconds: timeoutSeconds)
+        }.value
     }
 
-    private func stopWithWatchdog(timeoutSeconds: TimeInterval) async -> Bool {
-        let operation = AudioEngineStopOperation(engine: engine)
+    private func replaceEngineAfterTeardown(timeoutSeconds: TimeInterval) async -> Bool {
+        let oldEngine = engine
+        engine = AVAudioEngine()
+        engineRunning = false
+        let operation = AudioEngineTeardownOperation(engine: oldEngine, reset: true)
         operation.start()
         return await Task.detached(priority: .userInitiated) {
             operation.wait(timeoutSeconds: timeoutSeconds)
@@ -462,7 +687,7 @@ public actor AudioCaptureEngine {
             return
         }
 
-        if !engine.isRunning || Date().timeIntervalSince(lastFrameAt) > Self.callbackStallThreshold {
+        if !engineRunning || Date().timeIntervalSince(lastFrameAt) > Self.callbackStallThreshold {
             await recoverAudioEngine(reason: "callback_stalled")
         }
     }
@@ -487,7 +712,8 @@ public actor AudioCaptureEngine {
 
             recoveryAttempt = attempt
             lastFrameAt = nil
-            teardownEngine(force: true)
+            engineRunning = false
+            _ = await replaceEngineAfterTeardown(timeoutSeconds: 1)
             try? await Task.sleep(for: .milliseconds(attempt == 1 ? 100 : 250))
 
             guard sessionID == activeSessionID else {
@@ -501,7 +727,7 @@ public actor AudioCaptureEngine {
                 guard let existingWriter = writer else {
                     throw AudioCaptureError.streamOpenFailed
                 }
-                try installInputTapAndStart(outputFile: existingWriter, sessionID: activeSessionID)
+                try await setupAndStart(sessionID: activeSessionID, existingWriter: existingWriter)
                 if await waitForFirstFrame(timeout: .seconds(1)) {
                     isRecovering = false
                     recoveryAttempt = 0
@@ -528,7 +754,7 @@ public actor AudioCaptureEngine {
         default:
             .callbackStalled
         }
-        teardownEngine(force: true)
+        _ = await replaceEngineAfterTeardown(timeoutSeconds: 1)
         lastRecoverableCapture = makeRecoverableCapture()
     }
 
@@ -568,19 +794,9 @@ public actor AudioCaptureEngine {
         )
     }
 
-    private func teardownEngine(force: Bool) {
-        if force {
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
-            engine.reset()
-            engine = AVAudioEngine()
-        } else {
-            engine.stop()
-        }
-    }
-
     private func replaceEngineAfterStopTimeout() {
         engine = AVAudioEngine()
+        engineRunning = false
     }
 
     private func installEnvironmentObservers() {
@@ -616,22 +832,14 @@ public actor AudioCaptureEngine {
         await recoverAudioEngine(reason: "route_changed")
     }
 
-    private func handleSystemSleep() {
+    private func handleSystemSleep() async {
         if sessionID != nil {
             pendingError = .streamOpenFailed
-            teardownEngine(force: true)
+            _ = await replaceEngineAfterTeardown(timeoutSeconds: 1)
         }
     }
 
-    private func handleSystemWake() {
-        prepareEngineIfPossible()
-    }
-
-    private func prepareEngineIfPossible() {
-        let inputFormat = engine.inputNode.inputFormat(forBus: 0)
-        guard inputFormat.channelCount > 0 else {
-            return
-        }
-        engine.prepare()
+    private func handleSystemWake() async {
+        await prepareEngine()
     }
 }

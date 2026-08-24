@@ -152,4 +152,13 @@ final class StateMachineTests: XCTestCase {
         )
         XCTAssertEqual(contract.notificationCopy, "Microphone capture stopped. No audio is being recorded.")
     }
+
+    func testCaptureStartTimeoutContractWarnsThatAudioIsNotRecording() {
+        let contract = LifecycleStateMachine.uiContract(
+            for: .retryAvailable,
+            degradedReason: nil,
+            lastErrorCode: "capture_start_timed_out"
+        )
+        XCTAssertEqual(contract.notificationCopy, "Microphone capture stopped. No audio is being recorded.")
+    }
 }
