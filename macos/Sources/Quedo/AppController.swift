@@ -1906,6 +1906,8 @@ Next steps:
                 """
             case .noInputDevice:
                 return "No microphone input device was available. No audio is being recorded."
+            case .startTimedOut:
+                return "Quedo could not start microphone capture within its safety timeout. No audio is being recorded."
             case .writerFailed:
                 return "Quedo could not write microphone audio. No audio is being recorded."
             default:
@@ -1993,8 +1995,15 @@ Next steps:
     private func errorCode(forFailureStage stage: String, error: Error? = nil) -> String {
         switch stage {
         case "audio capture":
-            if let audioError = error as? AudioCaptureError, audioError == .callbackStalled {
-                return "capture_recovery_failed"
+            if let audioError = error as? AudioCaptureError {
+                switch audioError {
+                case .callbackStalled:
+                    return "capture_recovery_failed"
+                case .startTimedOut:
+                    return "capture_start_timed_out"
+                default:
+                    break
+                }
             }
             return "capture_open_failed"
         case "history pre-save", "history save":

@@ -330,7 +330,7 @@ public actor LifecycleStateMachine {
         case .retryAvailable:
             let copy: String
             switch lastErrorCode {
-            case "capture_open_failed", "capture_recovery_failed":
+            case "capture_open_failed", "capture_recovery_failed", "capture_start_timed_out":
                 copy = "Microphone capture stopped. No audio is being recorded."
             default:
                 copy = "Could not complete. Retry is available."
