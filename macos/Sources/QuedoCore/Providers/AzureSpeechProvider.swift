@@ -141,7 +141,7 @@ public struct AzureSpeechProvider: TranscriptionProvider {
     }
 
     private func supportsPhraseList(model: String) -> Bool {
-        model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "mai-transcribe-1.5"
+        model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "mai-transcribe-2"
     }
 
     private func makeEndpointURL(path: String, query: String? = nil) async throws -> URL? {

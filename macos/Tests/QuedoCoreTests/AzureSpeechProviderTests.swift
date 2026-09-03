@@ -30,7 +30,7 @@ final class AzureSpeechProviderTests: XCTestCase {
 
             let body = String(data: Self.bodyData(from: request), encoding: .utf8) ?? ""
             XCTAssertTrue(body.contains("name=\"definition\""))
-            XCTAssertTrue(body.contains("\"model\":\"mai-transcribe-1.5\""))
+            XCTAssertTrue(body.contains("\"model\":\"MAI-Transcribe-2\""))
             XCTAssertTrue(body.contains("\"locales\":[\"en\"]"))
             XCTAssertTrue(body.contains("\"phraseList\""))
             XCTAssertTrue(body.contains("\"Quedo\""))
@@ -56,7 +56,7 @@ final class AzureSpeechProviderTests: XCTestCase {
         let request = TranscriptionRequest(
             audioFileURL: audioURL,
             language: "en",
-            model: "mai-transcribe-1.5",
+            model: "MAI-Transcribe-2",
             context: "ignored by MAI provider",
             vocabularyHints: ["Quedo", "Futhark"]
         )

@@ -81,7 +81,13 @@ public actor ConfigurationManager {
             settings = shared
         }
 
+        let migratedDeprecatedModels = migrateDeprecatedTranscriptionModels(in: &settings)
         try validate(settings: settings)
+        if migratedDeprecatedModels {
+            // Persist the migration so a legacy 1.5 setting cannot become active again
+            // on a later launch or be reintroduced by the shared config file.
+            try saveSettings(settings)
+        }
         return settings
     }
 
@@ -583,6 +589,79 @@ public actor ConfigurationManager {
         case .elevenLabs:
             return provider.elevenLabsModel
         }
+    }
+
+    /// Moves all persisted MAI-Transcribe 1.5 selections to the current model.
+    ///
+    /// The provider-specific spelling is intentional: Azure expects the model
+    /// name while OpenRouter expects its fully-qualified model slug.
+    private func migrateDeprecatedTranscriptionModels(in settings: inout AppSettings) -> Bool {
+        var changed = migrateModel(
+            &settings.provider.azureSpeechModel,
+            provider: .azureSpeech,
+            from: "mai-transcribe-1.5",
+            to: ProviderConfiguration.defaultValue.azureSpeechModel
+        )
+        changed = migrateModel(
+            &settings.provider.openRouterModel,
+            provider: .openRouter,
+            from: "microsoft/mai-transcribe-1.5",
+            to: ProviderConfiguration.defaultValue.openRouterModel
+        ) || changed
+
+        for index in settings.recordingProfiles.indices {
+            let profile = settings.recordingProfiles[index]
+            var model = profile.model
+            var fallbackModel = profile.fallbackModel
+            let modelChanged = migrateModel(
+                &model,
+                provider: profile.provider,
+                from: profile.provider == .azureSpeech ? "mai-transcribe-1.5" : "microsoft/mai-transcribe-1.5",
+                to: profile.provider == .azureSpeech
+                    ? ProviderConfiguration.defaultValue.azureSpeechModel
+                    : ProviderConfiguration.defaultValue.openRouterModel
+            )
+            let fallbackChanged = migrateModel(
+                &fallbackModel,
+                provider: profile.fallbackProvider,
+                from: profile.fallbackProvider == .azureSpeech ? "mai-transcribe-1.5" : "microsoft/mai-transcribe-1.5",
+                to: profile.fallbackProvider == .azureSpeech
+                    ? ProviderConfiguration.defaultValue.azureSpeechModel
+                    : ProviderConfiguration.defaultValue.openRouterModel
+            )
+
+            if modelChanged || fallbackChanged {
+                settings.recordingProfiles[index] = RecordingShortcutProfile(
+                    id: profile.id,
+                    name: profile.name,
+                    hotkey: profile.hotkey,
+                    provider: profile.provider,
+                    fallbackProvider: profile.fallbackProvider,
+                    model: model,
+                    fallbackModel: fallbackModel,
+                    language: profile.language
+                )
+                changed = true
+            }
+        }
+
+        return changed
+    }
+
+    private func migrateModel(
+        _ model: inout String,
+        provider: ProviderKind,
+        from legacyModel: String,
+        to currentModel: String
+    ) -> Bool {
+        guard provider == .azureSpeech || provider == .openRouter else {
+            return false
+        }
+        guard model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == legacyModel else {
+            return false
+        }
+        model = currentModel
+        return true
     }
 
     private func parseSharedBool(_ value: String) -> Bool? {

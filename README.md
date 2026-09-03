@@ -91,11 +91,11 @@ Then set `Preferences -> Providers -> whisper.cpp model` to the printed model pa
 
 ### Azure Speech / MAI-Transcribe (macOS app provider)
 
-The macOS app can use Microsoft Azure Speech LLM Speech models, including `mai-transcribe-1.5`.
+The macOS app can use Microsoft Azure Speech LLM Speech models, including `MAI-Transcribe-2`.
 In `Preferences -> Provider Setup`, set:
 
 - Azure Speech endpoint, for example `https://<resource>.cognitiveservices.azure.com`
-- Azure Speech model, default `mai-transcribe-1.5`
+- Azure Speech model, default `MAI-Transcribe-2`
 - Azure Speech API key
 
 The shared config keys are `AZURE_SPEECH_ENDPOINT`, `AZURE_SPEECH_MODEL`, and `AZURE_SPEECH_KEY`.
@@ -105,7 +105,7 @@ The shared config keys are `AZURE_SPEECH_ENDPOINT`, `AZURE_SPEECH_MODEL`, and `A
 The macOS app can also use OpenRouter's generic speech-to-text endpoint with any OpenRouter transcription model slug.
 In `Preferences -> Provider Setup`, set:
 
-- OpenRouter model, for example `microsoft/mai-transcribe-1.5`
+- OpenRouter model, for example `microsoft/mai-transcribe-2`
 - OpenRouter API key
 
 The shared config keys are `OPENROUTER_MODEL` and `OPENROUTER_API_KEY`.
