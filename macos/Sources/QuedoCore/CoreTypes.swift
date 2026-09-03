@@ -344,8 +344,8 @@ public struct ProviderConfiguration: Codable, Sendable {
         groqModel: "whisper-large-v3",
         openAIModel: "gpt-4o-mini-transcribe",
         azureSpeechEndpoint: "",
-        azureSpeechModel: "mai-transcribe-1.5",
-        openRouterModel: "microsoft/mai-transcribe-1.5",
+        azureSpeechModel: "MAI-Transcribe-2",
+        openRouterModel: "microsoft/mai-transcribe-2",
         whisperCppModelPath: "ggml-large-v3.bin",
         whisperCppRuntime: .auto,
         elevenLabsModel: "scribe_v2"

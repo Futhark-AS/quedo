@@ -30,7 +30,7 @@ final class OpenRouterProviderTests: XCTestCase {
             XCTAssertEqual(request.value(forHTTPHeaderField: "X-Title"), "Quedo")
 
             let body = try JSONSerialization.jsonObject(with: Self.bodyData(from: request)) as? [String: Any]
-            XCTAssertEqual(body?["model"] as? String, "microsoft/mai-transcribe-1.5")
+            XCTAssertEqual(body?["model"] as? String, "microsoft/mai-transcribe-2")
             XCTAssertEqual(body?["language"] as? String, "en")
             let inputAudio = body?["input_audio"] as? [String: Any]
             XCTAssertEqual(inputAudio?["format"] as? String, "flac")
@@ -54,7 +54,7 @@ final class OpenRouterProviderTests: XCTestCase {
         let request = TranscriptionRequest(
             audioFileURL: audioURL,
             language: "en",
-            model: "microsoft/mai-transcribe-1.5",
+            model: "microsoft/mai-transcribe-2",
             context: nil,
             vocabularyHints: ["ignored"]
         )

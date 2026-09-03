@@ -334,14 +334,14 @@ struct PreferencesView: View {
                 }
 
                 settingRow("Azure Speech model") {
-                    TextField("mai-transcribe-1.5", text: $model.azureSpeechModel)
+                    TextField("MAI-Transcribe-2", text: $model.azureSpeechModel)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.body, design: .monospaced))
                         .frame(maxWidth: 340)
                 }
 
                 settingRow("OpenRouter model") {
-                    TextField("microsoft/mai-transcribe-1.5", text: $model.openRouterModel)
+                    TextField("microsoft/mai-transcribe-2", text: $model.openRouterModel)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.body, design: .monospaced))
                         .frame(maxWidth: 420)
@@ -969,8 +969,8 @@ final class PreferencesViewModel: ObservableObject {
     @Published var groqModel = "whisper-large-v3"
     @Published var openAIModel = "gpt-4o-mini-transcribe"
     @Published var azureSpeechEndpoint = ""
-    @Published var azureSpeechModel = "mai-transcribe-1.5"
-    @Published var openRouterModel = "microsoft/mai-transcribe-1.5"
+    @Published var azureSpeechModel = "MAI-Transcribe-2"
+    @Published var openRouterModel = "microsoft/mai-transcribe-2"
     @Published var whisperCppModelPath = "ggml-large-v3.bin"
     @Published var whisperCppRuntime: WhisperCppRuntime = .auto
     @Published var elevenLabsModel = "scribe_v2"

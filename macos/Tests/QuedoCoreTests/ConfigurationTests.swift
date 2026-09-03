@@ -112,6 +112,51 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertTrue(loaded.hotkeys.contains(norwegian.hotkey))
     }
 
+    func testLoadingMigratesDeprecatedMaiTranscribeModels() async throws {
+        let suiteName = "ConfigurationTests-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Unable to create isolated UserDefaults suite")
+            return
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let manager = ConfigurationManager(userDefaults: defaults, sharedConfigEnabled: false)
+        let legacyHotkey = HotkeyBinding(
+            actionID: "recording.default",
+            keyCode: 18,
+            modifiers: [.control, .shift]
+        )
+        var settings = AppSettings.default
+        settings.provider.azureSpeechEndpoint = "https://example.cognitiveservices.azure.com"
+        settings.provider.azureSpeechModel = "mai-transcribe-1.5"
+        settings.provider.openRouterModel = "microsoft/mai-transcribe-1.5"
+        settings.recordingProfiles = [
+            RecordingShortcutProfile(
+                id: "default",
+                name: "Default",
+                hotkey: legacyHotkey,
+                provider: .openRouter,
+                fallbackProvider: .azureSpeech,
+                model: "microsoft/mai-transcribe-1.5",
+                fallbackModel: "mai-transcribe-1.5",
+                language: "auto"
+            )
+        ]
+        settings.hotkeys = [legacyHotkey]
+
+        try await manager.saveSettings(settings)
+        let loaded = try await manager.loadSettings()
+
+        XCTAssertEqual(loaded.provider.azureSpeechModel, "MAI-Transcribe-2")
+        XCTAssertEqual(loaded.provider.openRouterModel, "microsoft/mai-transcribe-2")
+        XCTAssertEqual(loaded.recordingProfiles[0].model, "microsoft/mai-transcribe-2")
+        XCTAssertEqual(loaded.recordingProfiles[0].fallbackModel, "MAI-Transcribe-2")
+
+        let reloaded = try await manager.loadSettings()
+        XCTAssertEqual(reloaded.recordingProfiles[0].model, "microsoft/mai-transcribe-2")
+        XCTAssertEqual(reloaded.recordingProfiles[0].fallbackModel, "MAI-Transcribe-2")
+    }
+
     func testSharedConfigDoesNotCollapsePersistedRecordingProfiles() async throws {
         let suiteName = "ConfigurationTests-\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
