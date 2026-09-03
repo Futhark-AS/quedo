@@ -1217,8 +1217,18 @@ public actor TranscriptionPipeline {
     }
 
     private func diagnosticModelIdentifier(_ model: String) -> String {
-        let lastComponent = URL(fileURLWithPath: model).lastPathComponent
-        return lastComponent.isEmpty ? model : lastComponent
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Remote providers use qualified identifiers such as
+        // `microsoft/mai-transcribe-2`. Treat only path-like local model
+        // values as filesystem paths so diagnostics retain the provider
+        // namespace needed to identify the exact remote model.
+        guard trimmed.hasPrefix("/") || trimmed.hasPrefix("~") else {
+            return trimmed
+        }
+
+        let lastComponent = URL(fileURLWithPath: trimmed).lastPathComponent
+        return lastComponent.isEmpty ? trimmed : lastComponent
     }
 
     private func diagnosticAttributes(for error: Error) -> [String: String] {
