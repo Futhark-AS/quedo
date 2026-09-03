@@ -1,4 +1,5 @@
 import AVFoundation
+import Foundation
 import XCTest
 @testable import QuedoCore
 
@@ -217,6 +218,74 @@ final class TranscriptionPipelineTests: XCTestCase {
 
         XCTAssertEqual(calls, 1)
         XCTAssertEqual(capturedExtensions, ["wav"])
+    }
+
+    func testProviderDiagnosticsPreserveQualifiedRemoteModelIdentifier() async throws {
+        let testRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("quedo-pipeline-diagnostics-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: testRoot) }
+
+        let store = try HistoryStore(baseURL: testRoot)
+        let logger = AppLogger(
+            subsystem: "com.futhark.quedo.tests",
+            category: "pipeline-diagnostics",
+            fileLogger: RotatingFileLogger(directory: testRoot.appendingPathComponent("logs", isDirectory: true))
+        )
+        let diagnostics = DiagnosticsCenter(historyStore: store, logger: logger)
+        let sessionID = UUID()
+        let operationID = UUID()
+        await diagnostics.beginSessionTrace(
+            sessionID: sessionID,
+            operationID: operationID,
+            phase: "processing",
+            stage: "test_started",
+            providerPrimary: .openRouter,
+            language: "en"
+        )
+
+        let requestedModels = RequestedModelCollector()
+        let primary = ModelRecordingProvider(
+            kind: .openRouter,
+            mode: .alwaysSucceed("remote model diagnostic test"),
+            modelCollector: requestedModels
+        )
+        let fallback = MockProvider(kind: .groq, mode: .alwaysSucceed("unused"))
+        let pipeline = TranscriptionPipeline(
+            providers: [primary, fallback],
+            diagnostics: diagnostics
+        )
+
+        var settings = AppSettings.default
+        settings.provider.primary = .openRouter
+        settings.provider.fallback = .groq
+        let file = try makeTestWAV(
+            name: "pipeline-test-diagnostics-\(UUID().uuidString)",
+            durationSeconds: 1.0
+        )
+
+        _ = try await pipeline.transcribe(
+            audioFileURL: file,
+            settings: settings,
+            modelOverrides: TranscriptionModelOverrides(primaryModel: "microsoft/mai-transcribe-2"),
+            sessionID: sessionID,
+            operationID: operationID
+        )
+
+        let events = try await store.listDiagnosticEvents(limit: 100, sessionID: sessionID)
+        guard let attempt = events.first(where: { $0.eventName == "provider_attempt_started" }) else {
+            XCTFail("Expected provider attempt diagnostic event")
+            await diagnostics.shutdown()
+            return
+        }
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(attempt.payloadJSON.utf8)) as? [String: Any]
+        )
+
+        XCTAssertEqual(payload["provider"] as? String, "openRouter")
+        XCTAssertEqual(payload["model"] as? String, "microsoft/mai-transcribe-2")
+        let capturedModels = await requestedModels.values()
+        XCTAssertEqual(capturedModels[.openRouter], ["microsoft/mai-transcribe-2"])
+        await diagnostics.shutdown()
     }
 }
 
