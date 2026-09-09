@@ -42,6 +42,48 @@ final class TranscriptionPipelineTests: XCTestCase {
         XCTAssertEqual(models[.openAI], ["fallback-model"])
     }
 
+    func testStickyFallbackKeepsModelsWithTheirProviders() async throws {
+        let file = try makeTestWAV(name: "pipeline-sticky-models-\(UUID().uuidString)", durationSeconds: 1.0)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let requestedModels = RequestedModelCollector()
+        let primary = ModelRecordingProvider(kind: .openRouter, mode: .alwaysFail, modelCollector: requestedModels)
+        let fallback = ModelRecordingProvider(kind: .groq, mode: .alwaysSucceed("transcript"), modelCollector: requestedModels)
+        let pipeline = TranscriptionPipeline(providers: [primary, fallback])
+        var settings = AppSettings.default
+        settings.provider.primary = .openRouter
+        settings.provider.fallback = .groq
+        let overrides = TranscriptionModelOverrides(primaryModel: "microsoft/mai-transcribe-2", fallbackModel: "whisper-large-v3")
+
+        _ = try await pipeline.transcribe(audioFileURL: file, settings: settings, modelOverrides: overrides)
+        let second = try await pipeline.transcribe(audioFileURL: file, settings: settings, modelOverrides: overrides)
+        XCTAssertEqual(second.providerUsed, .groq)
+        let models = await requestedModels.values()
+        XCTAssertEqual(models[.groq], ["whisper-large-v3", "whisper-large-v3"])
+        XCTAssertEqual(models[.openRouter], ["microsoft/mai-transcribe-2", "microsoft/mai-transcribe-2"])
+    }
+
+    func testStickyFallbackFailureKeepsModelsOnRetryAndOriginalPrimary() async throws {
+        let file = try makeTestWAV(name: "pipeline-sticky-retry-models-\(UUID().uuidString)", durationSeconds: 1.0)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let requestedModels = RequestedModelCollector()
+        let primary = ModelRecordingProvider(kind: .openRouter, mode: .alwaysFail, modelCollector: requestedModels)
+        let fallback = ModelRecordingProvider(kind: .groq, mode: .succeedOnce, modelCollector: requestedModels)
+        let pipeline = TranscriptionPipeline(providers: [primary, fallback])
+        var settings = AppSettings.default
+        settings.provider.primary = .openRouter
+        settings.provider.fallback = .groq
+        let overrides = TranscriptionModelOverrides(primaryModel: "microsoft/mai-transcribe-2", fallbackModel: "whisper-large-v3")
+        _ = try await pipeline.transcribe(audioFileURL: file, settings: settings, modelOverrides: overrides)
+        do {
+            _ = try await pipeline.transcribe(audioFileURL: file, settings: settings, modelOverrides: overrides)
+            XCTFail("Both providers should fail on the second recording")
+        } catch TranscriptionPipelineError.retryAvailable {
+            let models = await requestedModels.values()
+            XCTAssertEqual(models[.groq], Array(repeating: "whisper-large-v3", count: 3))
+            XCTAssertEqual(models[.openRouter], Array(repeating: "microsoft/mai-transcribe-2", count: 3))
+        }
+    }
+
     func testCleanupRemovesKnownHallucinations() async throws {
         let file = try makeTestWAV(name: "pipeline-test-cleanup-\(UUID().uuidString)", durationSeconds: 1.0)
 
@@ -329,6 +371,7 @@ private actor RequestedModelCollector {
 private struct ModelRecordingProvider: TranscriptionProvider {
     enum Mode {
         case alwaysFail
+        case succeedOnce
         case alwaysSucceed(String)
     }
 
@@ -339,6 +382,12 @@ private struct ModelRecordingProvider: TranscriptionProvider {
     func transcribe(request: TranscriptionRequest) async throws -> TranscriptionResponse {
         await modelCollector.append(request.model, for: kind)
         switch mode {
+        case .succeedOnce:
+            let models = await modelCollector.values()
+            if models[kind]?.count == 1 {
+                return TranscriptionResponse(text: "transcript", provider: kind, isPartial: false)
+            }
+            throw ProviderError.transient(statusCode: 503)
         case .alwaysFail:
             throw ProviderError.transient(statusCode: 503)
         case let .alwaysSucceed(text):

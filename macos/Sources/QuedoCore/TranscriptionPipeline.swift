@@ -272,6 +272,12 @@ public actor TranscriptionPipeline {
 
         let preferredPrimary = fallbackIsSticky ? settings.provider.fallback : settings.provider.primary
         let preferredFallback = fallbackIsSticky ? settings.provider.primary : settings.provider.fallback
+        // Model overrides belong to configured providers, even when sticky failover
+        // reverses the order in which those providers are attempted.
+        let primaryModel = (fallbackIsSticky ? modelOverrides.fallbackModel : modelOverrides.primaryModel)
+            ?? model(for: preferredPrimary, settings: settings)
+        let fallbackModel = (fallbackIsSticky ? modelOverrides.primaryModel : modelOverrides.fallbackModel)
+            ?? model(for: preferredFallback, settings: settings)
 
         let preparedChunks = try prepareSourceChunks(audioFileURL)
         await emit(
@@ -299,7 +305,7 @@ public actor TranscriptionPipeline {
             let text = try await runChunks(
                 chunks: primaryPrepared.chunkFiles,
                 with: primary,
-                model: modelOverrides.primaryModel ?? model(for: preferredPrimary, settings: settings),
+                model: primaryModel,
                 language: settings.language,
                 vocabularyHints: settings.vocabularyHints,
                 attempt: "primary",
@@ -319,7 +325,7 @@ public actor TranscriptionPipeline {
                     let text = try await runChunks(
                         chunks: primaryPrepared.chunkFiles,
                         with: primary,
-                        model: modelOverrides.primaryModel ?? model(for: preferredPrimary, settings: settings),
+                        model: primaryModel,
                         language: settings.language,
                         vocabularyHints: settings.vocabularyHints,
                         attempt: "primary_retry",
@@ -337,7 +343,7 @@ public actor TranscriptionPipeline {
                         let text = try await runChunks(
                             chunks: fallbackPrepared.chunkFiles,
                             with: fallback,
-                            model: modelOverrides.fallbackModel ?? model(for: preferredFallback, settings: settings),
+                            model: fallbackModel,
                             language: settings.language,
                             vocabularyHints: settings.vocabularyHints,
                             attempt: "fallback_after_primary_retry",
@@ -367,7 +373,7 @@ public actor TranscriptionPipeline {
                 let text = try await runChunks(
                     chunks: fallbackPrepared.chunkFiles,
                     with: fallback,
-                    model: modelOverrides.fallbackModel ?? model(for: preferredFallback, settings: settings),
+                    model: fallbackModel,
                     language: settings.language,
                     vocabularyHints: settings.vocabularyHints,
                     attempt: "fallback",

@@ -1871,10 +1871,10 @@ Next steps:
             return """
             \(header)
 
-            Primary: \(providerLabel(primary)) (\(modelLabel(for: primary, settings: settings, override: modelOverrides.primaryModel)))
+            Primary: \(providerLabel(primary)) (\(modelLabel(for: primary, settings: settings, override: primary == settings.provider.primary ? modelOverrides.primaryModel : modelOverrides.fallbackModel)))
             Reason: \(primaryErrorDescription)
 
-            Fallback: \(providerLabel(fallback)) (\(modelLabel(for: fallback, settings: settings, override: modelOverrides.fallbackModel)))
+            Fallback: \(providerLabel(fallback)) (\(modelLabel(for: fallback, settings: settings, override: fallback == settings.provider.fallback ? modelOverrides.fallbackModel : modelOverrides.primaryModel)))
             Reason: \(fallbackErrorDescription)
             \(nextSteps)
             """
